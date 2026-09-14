@@ -1,31 +1,36 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v2.0.0
+   TALLERES CREATIVOS · v2.1.0
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
-   REESTRUCTURA IMPORTANTE v2.0.0 — "Talleres" ahora funciona así:
+   "Talleres" funciona en 3 niveles:
 
    1) 🎁 Juegos/Combos (ya existía) = el catálogo de "qué taller se
       puede hacer" (ej. "Taller Tetera", "Taller Cerámica"). Aquí SÍ
-      se definen materiales, margen y precio — pero se configura una
-      sola vez, no cada vez que agendas.
+      se definen materiales, margen y precio — se configura una sola
+      vez, no cada vez que agendas.
 
-   2) 📅 Inscripción (NUEVA) = agendar el espacio. Solo pide:
-      Fecha, Horario, Cupo (máximo de personas) y Duración estimada.
-      NADA de materiales ni clientes aquí.
+   2) 🎨 Taller / Nueva inscripción (el evento que se agenda) = solo
+      pide: Nombre del taller/evento, Fecha, Horario, Cupo (máximo de
+      personas) y Duración estimada. NADA de materiales ni clientes.
 
-   3) 👤 Participantes (NUEVO) = dentro de cada inscripción, se agrega
-      a cada persona con: Nombre, Teléfono (opcional) y qué Juego/Combo
-      (taller) va a hacer — cada quien puede elegir uno distinto. El
-      primero agregado queda como "titular" de la inscripción.
+   3) 👤 Participantes = dentro de cada taller creado, se agrega a
+      cada persona con: Nombre, Teléfono (opcional) y qué Juego(s)/
+      Combo(s) va a hacer — puede elegir UNO O VARIOS a la vez (v2.1.0:
+      antes solo permitía elegir uno; ahora Juan puede hacer, por
+      ejemplo, "Taller Tetera" + "Taller Tazas" en la misma inscripción,
+      y su monto se suma automáticamente). El café es una sola opción
+      por persona (no se repite por cada taller que elija). El primero
+      agregado queda como "titular" del evento.
 
-   El dinero se maneja en UNA sola cuenta compartida por inscripción
+   El dinero se maneja en UNA sola cuenta compartida por todo el evento
    (no una por persona): un total combinado, un solo saldo, y el
    anticipo siempre es automáticamente el 50% de ese total.
 
    Al agregar un participante se descuenta de inmediato el inventario
-   según los materiales de SU combo elegido; al quitarlo, se restaura.
+   según los materiales de TODOS los talleres que eligió; al quitarlo,
+   se restaura todo junto.
 
    (Se conservan las correcciones de versiones anteriores: contenido de
    combos, precio sugerido automático con casilla, y el precio de un
@@ -45,7 +50,7 @@ const CAFE_DEFAULT = 59;
 /* Caché de datos en memoria, se recarga después de cada guardado */
 let DB = {
   materiales: [], combos: [],
-  reservas: [], participantes: [], pagos: [],
+  reservas: [], participantes: [], participanteTalleres: [], pagos: [],
   ventas: [], sesionesAntiguas: [],
   settings: { cafe_precio: CAFE_DEFAULT }
 };
@@ -111,12 +116,30 @@ function expandirReceta(lista, factor) {
 function participantesDe(reservaId) {
   return DB.participantes.filter(p => p.reserva_id === reservaId).sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
 }
+/** Lista de talleres (uno o varios) que eligió un participante. */
+function talleresDeParticipante(participanteId) {
+  return DB.participanteTalleres.filter(t => t.participante_id === participanteId);
+}
+/** Texto legible "Tetera + Tazas" para mostrar en tablas. */
+function nombresTalleresTexto(participanteId) {
+  const ts = talleresDeParticipante(participanteId);
+  return ts.length ? ts.map(t => esc(t.combo_nombre)).join(' + ') : '<span class="mut">—</span>';
+}
+/** Junta los materiales (con su prefijo) de TODOS los talleres elegidos por un participante, para descontar/restaurar inventario en una sola operación. */
+function materialesCombinadosParticipante(participanteId) {
+  const ts = talleresDeParticipante(participanteId);
+  return ts.flatMap(t => t.materiales_snapshot || []);
+}
 function titularDe(reservaId) {
   const ps = participantesDe(reservaId);
   return ps.find(p => p.es_titular) || ps[0] || null;
 }
 function hayCupo(r) { return participantesDe(r.id).length < num(r.cupo); }
 
+/** Costo de materiales de TODOS los talleres que eligió un participante. */
+function costoTotalParticipante(participanteId) {
+  return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.costo_taller), 0);
+}
 function totalReserva(reservaId) { return participantesDe(reservaId).reduce((t, p) => t + num(p.monto_total), 0); }
 function pagadoReserva(reservaId) { return DB.pagos.filter(p => p.reserva_id === reservaId).reduce((t, p) => t + num(p.monto), 0); }
 function saldoReserva(reservaId) { const s = totalReserva(reservaId) - pagadoReserva(reservaId); return s > 0.004 ? s : 0; }
@@ -171,11 +194,12 @@ async function mostrarApp(session) {
    CARGA DE DATOS
    ===================================================================== */
 async function cargarTodo() {
-  const [materiales, combos, reservas, participantes, ventas, pagos, sesionesAntiguas, settingsRes] = await Promise.all([
+  const [materiales, combos, reservas, participantes, participanteTalleres, ventas, pagos, sesionesAntiguas, settingsRes] = await Promise.all([
     sb.from('materials').select('*').order('nombre'),
     sb.from('combos').select('*').order('nombre'),
     sb.from('reservas').select('*').order('fecha', { ascending: false }),
     sb.from('reserva_participantes').select('*').order('created_at'),
+    sb.from('participante_talleres').select('*').order('created_at'),
     sb.from('sales').select('*').order('fecha', { ascending: false }),
     sb.from('pagos').select('*').order('fecha', { ascending: false }),
     sb.from('sessions').select('*').order('fecha', { ascending: false }),
@@ -185,6 +209,7 @@ async function cargarTodo() {
   DB.combos = combos.data || [];
   DB.reservas = reservas.data || [];
   DB.participantes = participantes.data || [];
+  DB.participanteTalleres = participanteTalleres.data || [];
   DB.ventas = ventas.data || [];
   DB.pagos = pagos.data || [];
   DB.sesionesAntiguas = sesionesAntiguas.data || [];
@@ -214,7 +239,7 @@ const V = {};
 V.inicio = () => {
   const vT = DB.participantes.reduce((t, p) => t + num(p.monto_total), 0);
   const vV = DB.ventas.reduce((t, v) => t + num(v.total), 0);
-  const cT = DB.participantes.reduce((t, p) => t + num(p.costo_taller), 0);
+  const cT = DB.participantes.reduce((t, p) => t + costoTotalParticipante(p.id), 0);
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
   const cafeTotal = DB.participantes.reduce((t, p) => t + num(p.cafe_monto), 0);
   const vendido = vT + vV, costo = cT + cV;
@@ -495,6 +520,7 @@ V.talleres = () => {
     const total = totalReserva(r.id), pagado = pagadoReserva(r.id), saldo = saldoReserva(r.id);
     const est = estadoPagoReserva(r.id);
     return `<tr>
+      <td><b>${r.nombre ? esc(r.nombre) : '<span class="mut">Sin nombre</span>'}</b></td>
       <td>${fmtFecha(r.fecha)}${r.horario ? `<span class="mut">${esc(r.horario)}</span>` : ''}</td>
       <td><b>${titular ? esc(titular.nombre) : '<span class="mut">Sin participantes</span>'}</b>
           ${otros.length ? `<span class="mut">+${otros.length} más: ${otros.map(o => esc(o.nombre)).join(', ')}</span>` : ''}</td>
@@ -523,8 +549,8 @@ V.talleres = () => {
 
   return `
   <h2 class="titulo">📅 Talleres</h2>
-  <p class="sub">Agenda el espacio (fecha, horario, cupo, duración) y luego inscribe a cada participante con el taller que quiera hacer.</p>
-  <div style="margin-bottom:16px"><button class="btn" onclick="nuevaInscripcion()">＋ Nueva inscripción</button></div>
+  <p class="sub">Crea el taller (fecha, horario, cupo, duración) y luego inscribe a cada participante con lo que vaya a hacer.</p>
+  <div style="margin-bottom:16px"><button class="btn" onclick="nuevaInscripcion()">＋ Nuevo taller</button></div>
 
   <div class="card">
     <div class="toolbar" style="margin-bottom:14px">
@@ -534,8 +560,8 @@ V.talleres = () => {
       <button class="btn sec mini" style="align-self:flex-end" onclick="quitarFiltroInscripciones()">Quitar filtro</button>
     </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Fecha</th><th>Titular / participantes</th><th>Cupo</th><th>Duración</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
-      <tbody>${filas || `<tr><td colspan="9" style="text-align:center;color:var(--gris);padding:26px">Aún no hay inscripciones${filtroInscripciones.desde || filtroInscripciones.hasta ? ' en ese rango de fechas' : ''}.</td></tr>`}</tbody>
+      <thead><tr><th>Nombre del taller</th><th>Fecha</th><th>Titular / participantes</th><th>Cupo</th><th>Duración</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <tbody>${filas || `<tr><td colspan="10" style="text-align:center;color:var(--gris);padding:26px">Aún no hay talleres creados${filtroInscripciones.desde || filtroInscripciones.hasta ? ' en ese rango de fechas' : ''}.</td></tr>`}</tbody>
     </table></div>
   </div>
   ${historialAntiguo}`;
@@ -551,19 +577,20 @@ function quitarFiltroInscripciones() {
   go('talleres');
 }
 
-/* ---- Crear / editar los datos básicos de una inscripción ---- */
+/* ---- Crear / editar los datos básicos de un taller (fecha/horario/cupo/duración) ---- */
 function nuevaInscripcion(id) {
-  const r = id ? reserva(id) : { fecha: hoy(), horario: '', cupo: 4, duracion: 2 };
+  const r = id ? reserva(id) : { nombre: '', fecha: hoy(), horario: '', cupo: 4, duracion: 2 };
   document.getElementById('boxTipo').innerHTML = `
-  <div class="modal-head"><h3>📅 ${id ? 'Editar inscripción' : 'Nueva inscripción'}</h3>
+  <div class="modal-head"><h3>🎨 ${id ? 'Editar taller' : 'Nuevo taller'}</h3>
     <button class="cerrar" onclick="cerrar('mTipo')">✕</button></div>
   <div class="grid g2">
+    <div style="grid-column:1 / -1"><label>Nombre del taller</label><input id="i_nom" value="${esc(r.nombre || '')}" placeholder="Ej. Taller sabatino, Cumpleaños de Ana"></div>
     <div><label>Fecha</label><input type="date" id="i_fec" value="${r.fecha}"></div>
     <div><label>Horario</label><input id="i_hor" value="${esc(r.horario || '')}" placeholder="Ej. 16:00"></div>
     <div><label>Cupo (máximo de personas)</label><input type="number" id="i_cupo" value="${num(r.cupo)}" min="1"></div>
     <div><label>Duración estimada (horas)</label><input type="number" id="i_dur" value="${num(r.duracion)}" min="0" step="0.5"></div>
   </div>
-  <p class="tiny mut" style="margin-top:10px">Aquí solo agendas el espacio. Cada participante elegirá su propio taller (Cerámica, Tetera, etc.) al inscribirse, en el siguiente paso.</p>
+  <p class="tiny mut" style="margin-top:10px">Aquí solo defines el espacio. Cada participante elegirá qué taller(es) va a hacer (Cerámica, Tetera, etc., incluso más de uno) al inscribirse, en el siguiente paso.</p>
   <div id="inscripcionError"></div>
   <div class="acciones">
     ${id ? `<button class="btn rojo" onclick="borrarInscripcion('${id}')">Eliminar</button>` : ''}
@@ -578,6 +605,7 @@ async function guardarInscripcion(id) {
   if (cupo <= 0) return errBox.innerHTML = `<div class="error-box">El cupo debe ser mayor a cero.</div>`;
   const payload = {
     ...(id ? { id } : {}),
+    nombre: document.getElementById('i_nom').value.trim(),
     fecha: document.getElementById('i_fec').value || hoy(),
     horario: document.getElementById('i_hor').value.trim(),
     cupo, duracion: num(document.getElementById('i_dur').value)
@@ -591,11 +619,11 @@ async function guardarInscripcion(id) {
 async function borrarInscripcion(id) {
   const parts = participantesDe(id);
   const msg = parts.length
-    ? `Esta inscripción tiene ${parts.length} participante(s) y se perderá su información de pago. ¿Eliminar de todas formas?`
-    : '¿Eliminar esta inscripción?';
+    ? `Este taller tiene ${parts.length} participante(s) y se perderá su información de pago. ¿Eliminar de todas formas?`
+    : '¿Eliminar este taller?';
   if (!confirm(msg)) return;
   for (const p of parts) {
-    const consumo = expandirReceta(p.materiales_snapshot || [], 1);
+    const consumo = expandirReceta(materialesCombinadosParticipante(p.id), 1);
     for (const [materialId, cantidad] of consumo) {
       const m = mat(materialId);
       if (m) await sb.from('materials').update({ existencia: num(m.existencia) + cantidad }).eq('id', m.id);
@@ -608,7 +636,7 @@ async function borrarInscripcion(id) {
   go('talleres');
 }
 
-/* ---- Gestionar participantes y pagos de una inscripción ---- */
+/* ---- Gestionar participantes y pagos de un taller ---- */
 function gestionarInscripcion(id) {
   const r = reserva(id);
   if (!r) return;
@@ -618,18 +646,18 @@ function gestionarInscripcion(id) {
   const pagosDeEsta = DB.pagos.filter(p => p.reserva_id === id).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
 
   document.getElementById('boxSesion').innerHTML = `
-  <div class="modal-head"><h3>📅 Inscripción — ${fmtFecha(r.fecha)}${r.horario ? ' · ' + esc(r.horario) : ''}</h3>
+  <div class="modal-head"><h3>🎨 ${r.nombre ? esc(r.nombre) : 'Taller'} — ${fmtFecha(r.fecha)}${r.horario ? ' · ' + esc(r.horario) : ''}</h3>
     <button class="cerrar" onclick="cerrar('mSesion')">✕</button></div>
   <p class="tiny mut">Cupo: ${parts.length}/${num(r.cupo)} · Duración estimada: ${num(r.duracion)} h
     <button class="btn sec mini" style="margin-left:8px" onclick="cerrar('mSesion');nuevaInscripcion('${id}')">✏️ Editar datos</button></p>
 
   <h3 style="margin:16px 0 10px">Participantes</h3>
   <div class="tabla-wrap"><table>
-    <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller</th><th>Café</th><th>Monto</th><th></th></tr></thead>
+    <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller(es)</th><th>Café</th><th>Monto</th><th></th></tr></thead>
     <tbody>${parts.length ? parts.map(p => `<tr>
         <td><b>${esc(p.nombre)}</b>${p.es_titular ? '<span class="mut">Titular</span>' : ''}</td>
         <td>${p.telefono ? esc(p.telefono) : '<span class="mut">—</span>'}</td>
-        <td>${esc(p.combo_nombre)}</td>
+        <td>${nombresTalleresTexto(p.id)}</td>
         <td>${p.incluye_cafe ? '☕ Sí' : 'No'}</td>
         <td><b>${money(p.monto_total)}</b></td>
         <td><button class="btn rojo mini" onclick="quitarParticipante('${p.id}','${id}')">✕</button></td>
@@ -643,12 +671,19 @@ function gestionarInscripcion(id) {
     <div class="grid g2">
       <div><label>Nombre</label><input id="pp_nom" placeholder="Nombre del participante"></div>
       <div><label>Teléfono (opcional)</label><input id="pp_tel" placeholder="Ej. 722 123 4567"></div>
-      <div><label>¿Qué taller va a hacer?</label><select id="pp_combo">
-        ${DB.combos.length ? DB.combos.map(c => `<option value="${c.id}">${esc(c.nombre)} — ${money(comboPrecio(c))}</option>`).join('') : '<option value="">No hay juegos/combos creados todavía</option>'}
-      </select></div>
-      <div><label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:26px">
-        <input type="checkbox" id="pp_cafe" style="width:auto"> Incluye café (${money(DB.settings.cafe_precio || CAFE_DEFAULT)})
-      </label></div>
+    </div>
+    <label style="margin-top:12px">¿Qué taller(es) va a hacer? (puede elegir más de uno)</label>
+    <div id="pp_talleres_list" class="card" style="padding:10px 14px;margin-top:4px">
+      ${DB.combos.length ? DB.combos.map(c => `<label style="display:flex;align-items:center;gap:8px;padding:6px 0;font-weight:400">
+          <input type="checkbox" class="pp_taller_chk" value="${c.id}" onchange="actualizarTotalNuevoParticipante()" style="width:auto">
+          ${esc(c.nombre)} — ${money(comboPrecio(c))}
+        </label>`).join('') : '<p class="tiny mut">No hay juegos/combos creados todavía. Ve a 🎁 Juegos/Combos y crea al menos uno.</p>'}
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:10px">
+      <input type="checkbox" id="pp_cafe" onchange="actualizarTotalNuevoParticipante()" style="width:auto"> Incluye café (${money(DB.settings.cafe_precio || CAFE_DEFAULT)})
+    </label>
+    <div class="totales" id="pp_total_preview" style="margin-top:10px">
+      <div class="linea final"><span>Total de este participante</span><b>$0.00</b></div>
     </div>
     <div id="participanteError"></div>
     <div class="acciones"><button class="btn" onclick="guardarParticipante('${id}')">＋ Agregar participante</button></div>
@@ -656,7 +691,7 @@ function gestionarInscripcion(id) {
 
   <h3 style="margin:20px 0 10px">💳 Pagos</h3>
   <div class="totales">
-    <div class="linea"><span>Total de la inscripción</span><b>${money(total)}</b></div>
+    <div class="linea"><span>Total del taller (todos los participantes)</span><b>${money(total)}</b></div>
     <div class="linea"><span>Pagado hasta ahora</span><b style="color:var(--verde)">${money(pagado)}</b></div>
     <div class="linea final"><span>Saldo pendiente</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
   </div>
@@ -670,7 +705,7 @@ function gestionarInscripcion(id) {
       <button class="btn sec" onclick="guardarPagoLibre('${id}')">Registrar</button>
     </div>
   </div>
-  <div id="pagoError"></div>` : `<div class="nota" style="margin-top:10px">✅ Esta inscripción ya está pagada por completo.</div>`}
+  <div id="pagoError"></div>` : `<div class="nota" style="margin-top:10px">✅ Este taller ya está pagado por completo.</div>`}
 
   <h3 style="margin:18px 0 10px">Historial de pagos</h3>
   <div class="card" style="padding:12px 16px">
@@ -678,6 +713,21 @@ function gestionarInscripcion(id) {
   </div>
   <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cerrar</button></div>`;
   abrir('mSesion');
+  actualizarTotalNuevoParticipante();
+}
+
+/** Recalcula en vivo el total del participante que se está por agregar (suma de talleres elegidos + café). */
+function actualizarTotalNuevoParticipante() {
+  const preview = document.getElementById('pp_total_preview');
+  if (!preview) return;
+  const idsSeleccionados = [...document.querySelectorAll('.pp_taller_chk:checked')].map(chk => chk.value);
+  const cafe = document.getElementById('pp_cafe')?.checked || false;
+  const totalTalleres = idsSeleccionados.reduce((t, id2) => { const c = combo(id2); return t + (c ? comboPrecio(c) : 0); }, 0);
+  const cafeMonto = cafe ? num(DB.settings.cafe_precio || CAFE_DEFAULT) : 0;
+  preview.innerHTML = `
+    ${idsSeleccionados.length ? `<div class="linea"><span>${idsSeleccionados.length} taller(es) elegido(s)</span><b>${money(totalTalleres)}</b></div>` : ''}
+    ${cafe ? `<div class="linea cafe"><span>☕ Café</span><b>${money(cafeMonto)}</b></div>` : ''}
+    <div class="linea final"><span>Total de este participante</span><b>${money(totalTalleres + cafeMonto)}</b></div>`;
 }
 
 async function guardarParticipante(reservaId) {
@@ -685,21 +735,24 @@ async function guardarParticipante(reservaId) {
   const r = reserva(reservaId);
   const nombre = document.getElementById('pp_nom').value.trim();
   const telefono = document.getElementById('pp_tel').value.trim();
-  const comboId = document.getElementById('pp_combo').value;
+  const comboIds = [...document.querySelectorAll('.pp_taller_chk:checked')].map(chk => chk.value);
   const incluyeCafe = document.getElementById('pp_cafe').checked;
   if (!nombre) return errBox.innerHTML = `<div class="error-box">Escribe el nombre del participante.</div>`;
-  if (!comboId) return errBox.innerHTML = `<div class="error-box">Selecciona qué taller va a hacer (crea uno en 🎁 Juegos/Combos si aún no tienes ninguno).</div>`;
-  if (!hayCupo(r)) return errBox.innerHTML = `<div class="error-box">El cupo de esta inscripción ya está lleno.</div>`;
+  if (!comboIds.length) return errBox.innerHTML = `<div class="error-box">Selecciona al menos un taller que vaya a hacer (crea uno en 🎁 Juegos/Combos si aún no tienes ninguno).</div>`;
+  if (!hayCupo(r)) return errBox.innerHTML = `<div class="error-box">El cupo de este taller ya está lleno.</div>`;
 
-  const c = combo(comboId);
-  const costo = comboCosto(c), precio = comboPrecio(c);
+  const talleresElegidos = comboIds.map(cid => combo(cid)).filter(Boolean);
   const cafeMonto = incluyeCafe ? num(DB.settings.cafe_precio || CAFE_DEFAULT) : 0;
-  const montoTotal = precio + cafeMonto;
+  const precioTotal = talleresElegidos.reduce((t, c) => t + comboPrecio(c), 0);
+  const costoTotal = talleresElegidos.reduce((t, c) => t + comboCosto(c), 0);
+  const montoTotal = precioTotal + cafeMonto;
 
-  const consumo = expandirReceta(c.materiales, 1);
+  // Se combinan los materiales de TODOS los talleres elegidos para verificar/descontar inventario en un solo paso.
+  const materialesCombinados = talleresElegidos.flatMap(c => c.materiales || []);
+  const consumo = expandirReceta(materialesCombinados, 1);
   for (const [materialId, cantidadReq] of consumo) {
     const m = mat(materialId);
-    if (!m || num(m.existencia) < cantidadReq) return errBox.innerHTML = `<div class="error-box">Inventario insuficiente de ${m ? esc(m.nombre) : 'material'} para este taller.</div>`;
+    if (!m || num(m.existencia) < cantidadReq) return errBox.innerHTML = `<div class="error-box">Inventario insuficiente de ${m ? esc(m.nombre) : 'material'} para los talleres elegidos.</div>`;
   }
   for (const [materialId, cantidadReq] of consumo) {
     const m = mat(materialId);
@@ -708,23 +761,29 @@ async function guardarParticipante(reservaId) {
   }
 
   const esTitular = participantesDe(reservaId).length === 0;
-  const { error } = await sb.from('reserva_participantes').insert({
+  const { data: nuevoParticipante, error } = await sb.from('reserva_participantes').insert({
     reserva_id: reservaId, nombre, telefono, es_titular: esTitular,
-    combo_id: comboId, combo_nombre: c.nombre,
-    precio_taller: precio, costo_taller: costo,
-    incluye_cafe: incluyeCafe, cafe_monto: cafeMonto, monto_total: montoTotal,
-    materiales_snapshot: c.materiales
-  });
+    incluye_cafe: incluyeCafe, cafe_monto: cafeMonto, monto_total: montoTotal
+  }).select().single();
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
+
+  // Un renglón en participante_talleres por cada taller que eligió esta persona.
+  const filasTalleres = talleresElegidos.map(c => ({
+    participante_id: nuevoParticipante.id, combo_id: c.id, combo_nombre: c.nombre,
+    precio_taller: comboPrecio(c), costo_taller: comboCosto(c), materiales_snapshot: c.materiales
+  }));
+  const { error: errorTalleres } = await sb.from('participante_talleres').insert(filasTalleres);
+  if (errorTalleres) return errBox.innerHTML = `<div class="error-box">El participante se guardó, pero hubo un problema al registrar sus talleres: ${esc(errorTalleres.message)}</div>`;
+
   await cargarTodo();
   gestionarInscripcion(reservaId);
 }
 
 async function quitarParticipante(participanteId, reservaId) {
-  if (!confirm('¿Quitar a este participante? Se restaurará el material que se había descontado para su taller.')) return;
+  if (!confirm('¿Quitar a este participante? Se restaurará el material de TODOS los talleres que tenía elegidos.')) return;
   const p = DB.participantes.find(x => x.id === participanteId);
   if (!p) return;
-  const consumo = expandirReceta(p.materiales_snapshot || [], 1);
+  const consumo = expandirReceta(materialesCombinadosParticipante(participanteId), 1);
   for (const [materialId, cantidad] of consumo) {
     const m = mat(materialId);
     if (m) await sb.from('materials').update({ existencia: num(m.existencia) + cantidad }).eq('id', m.id);
@@ -837,7 +896,7 @@ async function guardarVenta() {
    ===================================================================== */
 V.resultados = () => {
   const vT = DB.participantes.reduce((t, p) => t + num(p.monto_total), 0);
-  const cT = DB.participantes.reduce((t, p) => t + num(p.costo_taller), 0);
+  const cT = DB.participantes.reduce((t, p) => t + costoTotalParticipante(p.id), 0);
   const cafeTotal = DB.participantes.reduce((t, p) => t + num(p.cafe_monto), 0);
   const vV = DB.ventas.reduce((t, v) => t + num(v.total), 0);
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
@@ -917,7 +976,7 @@ async function respaldar() {
   const data = {
     exportado_en: new Date().toISOString(),
     materiales: DB.materiales, combos: DB.combos,
-    reservas: DB.reservas, participantes: DB.participantes, pagos: DB.pagos,
+    reservas: DB.reservas, participantes: DB.participantes, participanteTalleres: DB.participanteTalleres, pagos: DB.pagos,
     ventas: DB.ventas, sesionesAntiguas: DB.sesionesAntiguas, settings: DB.settings
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
