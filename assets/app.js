@@ -1,36 +1,23 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v1.3.0
+   TALLERES CREATIVOS · v1.4.0
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
-   NOVEDADES DE ESTA VERSIÓN (v1.3.0):
-   - CORRECCIÓN: la columna "Contenido" en Juegos/Combos se quedaba en
-     blanco al usar el nuevo selector de materiales (guardaba
-     "mat:<id>" y esa columna no sabía quitar el prefijo). Ya corregido
-     para cualquier cantidad de materiales.
-   - CORRECCIÓN: vender un Juego/Combo desde Ventas ahora descuenta bien
-     el inventario real de cada material que lo compone.
-   - NUEVO: los menús de materiales muestran el COSTO (lo que a ti te
-     cuesta) y la VENTA sugerida por separado, para no confundirlos.
-   - NUEVO: al crear/editar un Tipo de taller, puedes elegir un
-     Juego/Combo ya armado (aparece con 🎁) en vez de repetir material
-     por material.
-   - NUEVO: botón "🎨 Agregar todas las pinturas" en Talleres y Combos:
-     agrega de un clic todas tus pinturas con una cantidad base (tú
-     decides cuántos ml), y luego puedes ajustar cada una si necesitas
-     más o menos.
-   - CORRECCIÓN IMPORTANTE DE PRECIO: antes, el "Precio final" de un
-     Taller o Combo se podía quedar "congelado" en un número viejo
-     aunque agregaras más materiales (por ejemplo, iba subiendo el
-     costo pero el precio de venta no se movía, dejando poca o nula
-     ganancia). Ahora hay una casilla explícita:
-       ☑ Usar precio sugerido automáticamente
-     - Marcada (recomendado): el precio de venta SIEMPRE se recalcula
-       solo, usando costo de materiales + tu margen, cada vez que
-       agregas/quitas materiales o cambias el margen.
-     - Desmarcada: tú escribes un precio fijo a mano (por ejemplo para
-       una promoción) y ese sí se queda fijo aunque cambie el costo.
+   NOVEDADES DE ESTA VERSIÓN (v1.4.0):
+   - NUEVO: cada taller registrado ahora guarda Cliente y Teléfono
+     (opcional), para saber de quién es cada taller.
+   - NUEVO: sistema de pagos/abonos. Al registrar un taller indicas si
+     el cliente pagó completo o dejó un anticipo; después puedes ir
+     agregando abonos hasta liquidarlo. Cada taller muestra su estado:
+     🟢 Pagado · 🟡 Parcial · 🔴 Pendiente, y el saldo que debe.
+   - NUEVO: filtro por rango de fechas (desde/hasta) en "Talleres
+     realizados", para buscar por periodo.
+   - NUEVO: sección "Cuentas por cobrar" en Resultados, con el total
+     que te deben los clientes y el detalle de cada saldo pendiente.
+   - (Se conservan todas las correcciones de versiones anteriores:
+     contenido de combos, precio sugerido automático con casilla,
+     descuento correcto de inventario al usar combos, etc.)
    ===================================================================== */
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -44,7 +31,10 @@ const fmtFecha = f => f ? new Date(f).toLocaleDateString('es-MX') : '';
 const CAFE_DEFAULT = 59;
 
 /* Caché de datos en memoria, se recarga después de cada guardado */
-let DB = { materiales: [], tipos: [], combos: [], sesiones: [], ventas: [], settings: { cafe_precio: CAFE_DEFAULT } };
+let DB = { materiales: [], tipos: [], combos: [], sesiones: [], ventas: [], pagos: [], settings: { cafe_precio: CAFE_DEFAULT } };
+
+/* Filtro de fechas para "Talleres realizados" (se guarda en memoria mientras navegas) */
+let filtroTalleres = { desde: '', hasta: '' };
 
 const mat = id => DB.materiales.find(m => m.id === id);
 const combo = id => DB.combos.find(c => c.id === id);
@@ -56,14 +46,12 @@ const combo = id => DB.combos.find(c => c.id === id);
    "mat:abc123" o "combo:xyz789". Esto permite que un Tipo de taller
    pueda usar tanto materiales sueltos como juegos ya armados.
    Los combos, para no complicarse, solo contienen materiales sueltos.
-
-   parseRef() también acepta datos "viejos" guardados sin prefijo
-   (combos creados antes de esta función) y los trata como material.
+   parseRef() también acepta datos "viejos" guardados sin prefijo.
    --------------------------------------------------------------------- */
 function parseRef(ref) {
   if (typeof ref !== 'string' || !ref) return ['mat', ''];
   const idx = ref.indexOf(':');
-  if (idx === -1) return ['mat', ref]; // formato viejo: id de material sin prefijo
+  if (idx === -1) return ['mat', ref];
   return [ref.slice(0, idx), ref.slice(idx + 1)];
 }
 const refMat = id => `mat:${id}`;
@@ -76,14 +64,11 @@ const costoUnit = m => num(m.cant_adq) > 0 ? num(m.costo_adq) / num(m.cant_adq) 
 const precioUnitSug = m => costoUnit(m) * (1 + num(m.margen) / 100);
 const gananciaUnit = m => precioUnitSug(m) - costoUnit(m);
 
-/** Costo de una sola línea de receta (puede apuntar a un material o a un combo). */
 function costoUnitRef(ref) {
   const [tipo, id] = parseRef(ref);
   if (tipo === 'combo') { const c = combo(id); return c ? comboCosto(c) : 0; }
   const m = mat(id); return m ? costoUnit(m) : 0;
 }
-
-/** Costo total de una lista de líneas de receta (materiales y/o combos). */
 function costoLista(lista) {
   return (lista || []).reduce((t, l) => t + costoUnitRef(l.material_id) * num(l.cantidad), 0);
 }
@@ -91,7 +76,6 @@ function comboCosto(c) { return costoLista(c.materiales); }
 function comboPrecio(c) { const co = comboCosto(c); return num(c.precio_final) > 0 ? num(c.precio_final) : co * (1 + num(c.margen) / 100); }
 function comboGanancia(c) { return comboPrecio(c) - comboCosto(c); }
 
-/** Texto legible del contenido de una receta (para mostrar en tablas). */
 function contenidoTexto(lista) {
   return (lista || []).map(l => {
     const [tipo, id] = parseRef(l.material_id);
@@ -100,13 +84,7 @@ function contenidoTexto(lista) {
   }).filter(Boolean).join('<br>');
 }
 
-/**
- * Expande una receta (que puede incluir combos) a cantidades reales de
- * materiales base, multiplicadas por un factor (personas o cantidad
- * vendida). Devuelve un Map(materialId -> cantidadTotalRequerida).
- * Así, si un taller usa un Juego/Combo, el inventario que se descuenta
- * es el de los materiales reales que forman ese combo.
- */
+/** Expande una receta (que puede incluir combos) a cantidades reales de materiales base. */
 function expandirReceta(lista, factor) {
   const mapa = new Map();
   const agregar = (id, cantidad) => mapa.set(id, (mapa.get(id) || 0) + cantidad);
@@ -114,12 +92,8 @@ function expandirReceta(lista, factor) {
     (subLista || []).forEach(l => {
       const [tipo, id] = parseRef(l.material_id);
       const cantidadTotal = num(l.cantidad) * factorLocal;
-      if (tipo === 'combo') {
-        const c = combo(id);
-        if (c) procesar(c.materiales, cantidadTotal);
-      } else {
-        agregar(id, cantidadTotal);
-      }
+      if (tipo === 'combo') { const c = combo(id); if (c) procesar(c.materiales, cantidadTotal); }
+      else { agregar(id, cantidadTotal); }
     });
   };
   procesar(lista, factor);
@@ -143,6 +117,31 @@ function resumenTipo(t, personas) {
     costoTotal: costoMat * per,
     utilidadTotal: utilidad * per
   };
+}
+
+/* ---------------------------------------------------------------------
+   PAGOS / SALDOS de talleres
+   --------------------------------------------------------------------- */
+/** Monto total que se le debe cobrar a un taller ya registrado (incluye café si aplica). */
+function montoACobrarSesion(s) {
+  return num(s.total_cafe) > 0 ? num(s.total_cafe) : num(s.total_taller);
+}
+/** Suma de todos los abonos/pagos registrados para una sesión. */
+function pagadoSesion(sesionId) {
+  return DB.pagos.filter(p => p.sesion_id === sesionId).reduce((t, p) => t + num(p.monto), 0);
+}
+/** Saldo pendiente de una sesión (nunca negativo para mostrar). */
+function saldoSesion(s) {
+  const saldo = montoACobrarSesion(s) - pagadoSesion(s.id);
+  return saldo > 0.004 ? saldo : 0;
+}
+/** Estado de pago de una sesión: {label, clase} para pintar un chip. */
+function estadoPagoSesion(s) {
+  const pagado = pagadoSesion(s.id);
+  const saldo = saldoSesion(s);
+  if (pagado <= 0.004) return { label: '🔴 Pendiente', clase: 'bajo' };
+  if (saldo <= 0.004) return { label: '🟢 Pagado', clase: 'ok' };
+  return { label: '🟡 Parcial', clase: 'warn' };
 }
 
 /* =====================================================================
@@ -179,7 +178,6 @@ async function mostrarApp(session) {
   go('inicio');
 }
 
-/* Al cargar la página, revisa si ya había una sesión activa */
 (async () => {
   const { data: { session } } = await sb.auth.getSession();
   if (session) { await mostrarApp(session); }
@@ -189,12 +187,13 @@ async function mostrarApp(session) {
    CARGA DE DATOS
    ===================================================================== */
 async function cargarTodo() {
-  const [materiales, tipos, combos, sesiones, ventas, settingsRes] = await Promise.all([
+  const [materiales, tipos, combos, sesiones, ventas, pagos, settingsRes] = await Promise.all([
     sb.from('materials').select('*').order('nombre'),
     sb.from('workshop_types').select('*').order('nombre'),
     sb.from('combos').select('*').order('nombre'),
     sb.from('sessions').select('*').order('fecha', { ascending: false }),
     sb.from('sales').select('*').order('fecha', { ascending: false }),
+    sb.from('pagos').select('*').order('fecha', { ascending: false }),
     sb.from('settings').select('*').eq('id', 'main').maybeSingle()
   ]);
   DB.materiales = materiales.data || [];
@@ -202,6 +201,7 @@ async function cargarTodo() {
   DB.combos = combos.data || [];
   DB.sesiones = sesiones.data || [];
   DB.ventas = ventas.data || [];
+  DB.pagos = pagos.data || [];
   DB.settings = settingsRes.data || { cafe_precio: CAFE_DEFAULT };
 }
 
@@ -226,10 +226,11 @@ const V = {};
    INICIO
    ===================================================================== */
 V.inicio = () => {
-  const vendido = DB.sesiones.reduce((t, s) => t + num(s.total_taller), 0) + DB.ventas.reduce((t, v) => t + num(v.total), 0);
+  const vendido = DB.sesiones.reduce((t, s) => t + montoACobrarSesion(s), 0) + DB.ventas.reduce((t, v) => t + num(v.total), 0);
   const costo = DB.sesiones.reduce((t, s) => t + num(s.costo_mat), 0) + DB.ventas.reduce((t, v) => t + num(v.costo), 0);
   const cafe = DB.sesiones.reduce((t, s) => t + num(s.cafe_negocio), 0);
   const bajo = DB.materiales.filter(m => num(m.existencia) <= num(m.minimo)).length;
+  const porCobrar = DB.sesiones.reduce((t, s) => t + saldoSesion(s), 0);
   return `
   <h2 class="titulo">Hola 👋</h2><p class="sub">Resumen rápido del negocio.</p>
   <div class="grid g4">
@@ -237,6 +238,9 @@ V.inicio = () => {
     <div class="kpi"><small>COSTO MATERIAL</small><b>${money(costo)}</b></div>
     <div class="kpi"><small>UTILIDAD</small><b>${money(vendido - costo)}</b></div>
     <div class="kpi"><small>☕ CAFÉ (NEGOCIO)</small><b>${money(cafe)}</b></div>
+  </div>
+  <div class="grid g4" style="margin-top:14px">
+    <div class="kpi" style="${porCobrar > 0 ? 'background:#fff5d8' : ''}"><small>POR COBRAR (TALLERES)</small><b style="${porCobrar > 0 ? 'color:#9a6d00' : ''}">${money(porCobrar)}</b></div>
   </div>
   <div class="card" style="margin-top:18px"><h3>Estado del inventario</h3>
     ${bajo ? `<p style="color:var(--rojo);font-weight:700">⚠ ${bajo} material(es) en stock bajo.</p>`
@@ -346,17 +350,12 @@ async function borrarMat(id) {
 /* ---------------------------------------------------------------------
    Filas "material/combo + cantidad" reutilizadas por Talleres y Combos
    --------------------------------------------------------------------- */
-
-/** Etiqueta de un material mostrando COSTO (lo que te cuesta) y VENTA sugerida por separado. */
 function etiquetaMaterial(m) {
   return `${esc(m.nombre)} — costo ${money(costoUnit(m))}/${esc(m.unidad)} · venta sug. ${money(precioUnitSug(m))}/${esc(m.unidad)}`;
 }
-/** Etiqueta de un combo/juego mostrando su COSTO y su PRECIO DE VENTA actuales. */
 function etiquetaCombo(c) {
   return `🎁 ${esc(c.nombre)} (juego) — costo ${money(comboCosto(c))} · venta ${money(comboPrecio(c))}`;
 }
-
-/** Opciones de <select> incluyendo solo materiales (usado dentro de Combos). */
 function opcionesSoloMateriales(sel) {
   const [, selId] = parseRef(sel || '');
   return DB.materiales.map(m => {
@@ -365,8 +364,6 @@ function opcionesSoloMateriales(sel) {
     return `<option value="${val}" ${selected ? 'selected' : ''}>${etiquetaMaterial(m)}</option>`;
   }).join('');
 }
-
-/** Opciones de <select> incluyendo materiales Y juegos/combos (usado dentro de Talleres). */
 function opcionesMaterialesYCombos(sel) {
   const [selTipo, selId] = parseRef(sel || '');
   const mats = DB.materiales.map(m => {
@@ -382,12 +379,6 @@ function opcionesMaterialesYCombos(sel) {
   if (!combosOpts) return mats;
   return `<optgroup label="📦 Materiales (costo de fabricación)">${mats}</optgroup><optgroup label="🎁 Juegos / Combos">${combosOpts}</optgroup>`;
 }
-
-/**
- * Genera una fila "Material + Cantidad".
- * prefix 't' = fila de Tipo de taller (admite materiales y combos).
- * prefix 'c' = fila de Combo (solo materiales, para no anidar combos).
- */
 function filaMat(prefix, l = {}) {
   const opciones = prefix === 't' ? opcionesMaterialesYCombos(l.material_id) : opcionesSoloMateriales(l.material_id);
   const refresh = prefix === 't' ? 'prevTipo' : 'prevCombo';
@@ -403,22 +394,12 @@ function leerFilas(prefix, contenedorId) {
     .map(f => ({ material_id: f.querySelector(`.${prefix}m`).value, cantidad: num(f.querySelector(`.${prefix}q`).value) }))
     .filter(l => l.material_id && l.cantidad > 0);
 }
-
-/**
- * Agrega de un clic todas las pinturas del inventario (categoría "Pinturas")
- * con una cantidad base que tú eliges (10 ml sugerido). Si una pintura ya
- * estaba en la lista, no la duplica. Luego puedes ajustar cada una a mano.
- */
 function agregarTodasPinturas(prefix, contenedorId) {
   const pinturas = DB.materiales.filter(m => m.categoria === 'Pinturas');
-  if (!pinturas.length) {
-    alert('No tienes materiales en la categoría "Pinturas" todavía. Agrégalos primero en Inventario.');
-    return;
-  }
+  if (!pinturas.length) { alert('No tienes materiales en la categoría "Pinturas" todavía. Agrégalos primero en Inventario.'); return; }
   const respuesta = prompt('¿Cuántos ml de cada color quieres asignar? (podrás ajustar cada color después)', '10');
   if (respuesta === null) return;
   const base = num(respuesta) > 0 ? num(respuesta) : 10;
-
   const yaPuestos = new Set(leerFilas(prefix, contenedorId).map(l => l.material_id));
   const contenedor = document.getElementById(contenedorId);
   let agregadas = 0;
@@ -428,7 +409,6 @@ function agregarTodasPinturas(prefix, contenedorId) {
     contenedor.insertAdjacentHTML('beforeend', filaMat(prefix, { material_id: val, cantidad: base }));
     agregadas++;
   });
-
   if (prefix === 't') prevTipo(); else prevCombo();
   if (!agregadas) alert('Ya tenías todas las pinturas agregadas en esta lista.');
 }
@@ -437,7 +417,7 @@ function agregarTodasPinturas(prefix, contenedorId) {
    TALLERES (tipos + sesiones registradas)
    ===================================================================== */
 V.talleres = () => {
-  const filas = DB.tipos.map(t => {
+  const filasTipos = DB.tipos.map(t => {
     const r = resumenTipo(t, 1);
     const cafe = num(DB.settings.cafe_precio || CAFE_DEFAULT);
     return `<tr>
@@ -451,26 +431,64 @@ V.talleres = () => {
           <button class="btn sec mini" onclick="editarTipo('${t.id}')">✏️</button></td>
     </tr>`;
   }).join('');
-  const hist = DB.sesiones.map(s => `<tr>
-      <td>${fmtFecha(s.fecha)}</td><td>${esc(s.tipo_nombre)}</td><td>${s.personas}</td>
+
+  // Aplica el filtro de fechas (si el usuario definió desde/hasta)
+  const sesionesFiltradas = DB.sesiones.filter(s => {
+    if (filtroTalleres.desde && s.fecha < filtroTalleres.desde) return false;
+    if (filtroTalleres.hasta && s.fecha > filtroTalleres.hasta) return false;
+    return true;
+  });
+
+  const hist = sesionesFiltradas.map(s => {
+    const est = estadoPagoSesion(s);
+    const saldo = saldoSesion(s);
+    return `<tr>
+      <td>${fmtFecha(s.fecha)}</td>
+      <td><b>${esc(s.cliente || '—')}</b>${s.telefono ? `<span class="mut">${esc(s.telefono)}</span>` : ''}</td>
+      <td>${esc(s.tipo_nombre)}</td><td>${s.personas}</td>
       <td><b>${money(s.total_taller)}</b></td>
       <td>${s.total_cafe ? money(s.total_cafe) : '<span class="mut">—</span>'}</td>
       <td>${money(s.costo_mat)}</td>
-      <td style="color:var(--verde);font-weight:700">${money(s.utilidad)}</td></tr>`).join('');
+      <td style="color:var(--verde);font-weight:700">${money(s.utilidad)}</td>
+      <td><span class="chip ${est.clase}">${est.label}</span></td>
+      <td>${saldo > 0 ? `<b style="color:var(--rojo)">${money(saldo)}</b>` : `<span class="mut">$0.00</span>`}</td>
+      <td><button class="btn sec mini" onclick="abrirPago('${s.id}')">💳 Pago</button></td>
+    </tr>`;
+  }).join('');
+
   return `
   <h2 class="titulo">🎨 Talleres</h2>
   <p class="sub">Cada tipo muestra su precio de venta y, cuando aplica, el total con café en un solo renglón.</p>
   <div style="margin-bottom:16px"><button class="btn" onclick="editarTipo()">＋ Nuevo tipo de taller</button></div>
   <div class="tabla-wrap"><table>
     <thead><tr><th>Taller</th><th>Costo material</th><th>Total taller</th><th>Total taller con café</th><th>Utilidad</th><th>Margen</th><th>Acción</th></tr></thead>
-    <tbody>${filas || `<tr><td colspan="7" style="text-align:center;color:var(--gris);padding:26px">Aún no hay tipos de taller.</td></tr>`}</tbody>
+    <tbody>${filasTipos || `<tr><td colspan="7" style="text-align:center;color:var(--gris);padding:26px">Aún no hay tipos de taller.</td></tr>`}</tbody>
   </table></div>
-  <div class="card" style="margin-top:20px"><h3>Talleres realizados</h3>
+
+  <div class="card" style="margin-top:20px">
+    <h3>Talleres realizados</h3>
+    <div class="toolbar" style="margin-bottom:14px">
+      <div><label style="margin:0 0 4px">Desde</label><input type="date" id="ft_desde" value="${filtroTalleres.desde}" style="min-width:150px"></div>
+      <div><label style="margin:0 0 4px">Hasta</label><input type="date" id="ft_hasta" value="${filtroTalleres.hasta}" style="min-width:150px"></div>
+      <button class="btn sec mini" style="align-self:flex-end" onclick="aplicarFiltroTalleres()">Filtrar</button>
+      <button class="btn sec mini" style="align-self:flex-end" onclick="quitarFiltroTalleres()">Quitar filtro</button>
+    </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Fecha</th><th>Taller</th><th>Personas</th><th>Total taller</th><th>Total con café</th><th>Costo material</th><th>Utilidad</th></tr></thead>
-      <tbody>${hist || `<tr><td colspan="7" style="text-align:center;color:var(--gris);padding:22px">Sin talleres registrados.</td></tr>`}</tbody>
-    </table></div></div>`;
+      <thead><tr><th>Fecha</th><th>Cliente</th><th>Taller</th><th>Personas</th><th>Total taller</th><th>Total con café</th><th>Costo material</th><th>Utilidad</th><th>Pago</th><th>Saldo</th><th>Acción</th></tr></thead>
+      <tbody>${hist || `<tr><td colspan="11" style="text-align:center;color:var(--gris);padding:22px">Sin talleres registrados${filtroTalleres.desde || filtroTalleres.hasta ? ' en ese rango de fechas' : ''}.</td></tr>`}</tbody>
+    </table></div>
+  </div>`;
 };
+
+function aplicarFiltroTalleres() {
+  filtroTalleres.desde = document.getElementById('ft_desde').value || '';
+  filtroTalleres.hasta = document.getElementById('ft_hasta').value || '';
+  go('talleres');
+}
+function quitarFiltroTalleres() {
+  filtroTalleres = { desde: '', hasta: '' };
+  go('talleres');
+}
 
 function editarTipo(id) {
   const t = id ? DB.tipos.find(x => x.id === id) : { nombre: '', duracion: 2.5, margen: 50, precio_final: 0, incluye_cafe: false, materiales: [] };
@@ -519,22 +537,11 @@ function prevTipo() {
   const margen = num(document.getElementById('t_mar').value);
   const pfField = document.getElementById('t_pf');
   const costoMat = costoLista(materiales);
-
   pfField.disabled = auto;
   let precioFinalEfectivo;
-  if (auto) {
-    const sugerido = costoMat * (1 + margen / 100);
-    pfField.value = sugerido.toFixed(2);
-    precioFinalEfectivo = 0; // 0 = "usa el cálculo automático"
-  } else {
-    precioFinalEfectivo = num(pfField.value);
-  }
-
-  const tTmp = {
-    materiales, margen, precio_final: precioFinalEfectivo,
-    duracion: num(document.getElementById('t_dur').value),
-    incluye_cafe: document.getElementById('t_cafe').value === 'si'
-  };
+  if (auto) { const sugerido = costoMat * (1 + margen / 100); pfField.value = sugerido.toFixed(2); precioFinalEfectivo = 0; }
+  else { precioFinalEfectivo = num(pfField.value); }
+  const tTmp = { materiales, margen, precio_final: precioFinalEfectivo, duracion: num(document.getElementById('t_dur').value), incluye_cafe: document.getElementById('t_cafe').value === 'si' };
   const per = Math.max(1, num(document.getElementById('t_per').value));
   const r = resumenTipo(tTmp, per);
   document.getElementById('prevTipo').innerHTML = `
@@ -569,13 +576,15 @@ async function borrarTipo(id) {
   await cargarTodo(); cerrar('mTipo'); go('talleres');
 }
 
-/* ---- Registrar taller impartido (sesión) ---- */
+/* ---- Registrar taller impartido (sesión), con Cliente y Pago inicial ---- */
 function nuevaSesion(id) {
   const t = DB.tipos.find(x => x.id === id);
   document.getElementById('boxSesion').innerHTML = `
   <div class="modal-head"><h3>🎨 Registrar taller — ${esc(t.nombre)}</h3>
     <button class="cerrar" onclick="cerrar('mSesion')">✕</button></div>
   <div class="grid g2">
+    <div><label>Cliente</label><input id="s_cli" placeholder="Nombre del cliente"></div>
+    <div><label>Teléfono (opcional)</label><input id="s_tel" placeholder="Ej. 722 123 4567"></div>
     <div><label>Fecha</label><input type="date" id="s_fec" value="${hoy()}"></div>
     <div><label>Personas</label><input type="number" id="s_per" value="1" min="1" oninput="prevSesion('${id}')"></div>
     <div><label>¿Se cobró café?</label><select id="s_cafe" onchange="prevSesion('${id}')">
@@ -583,22 +592,39 @@ function nuevaSesion(id) {
       <option value="${t.incluye_cafe ? 'no' : 'si'}">${t.incluye_cafe ? 'No' : 'Sí'}</option></select></div>
   </div>
   <div class="totales" id="prevSesion"></div>
-  <div class="nota">Al guardar se descuenta automáticamente el material del inventario (si el taller usa un combo, se descuentan los materiales reales que lo forman).</div>
+  <h3 style="margin:18px 0 10px">💳 Pago</h3>
+  <label style="display:flex;align-items:center;gap:6px;font-weight:400;font-size:13px;color:var(--suave);margin-bottom:8px">
+    <input type="checkbox" id="s_pago_completo" checked onchange="prevSesion('${id}')" style="width:auto">
+    El cliente ya pagó completo
+  </label>
+  <div class="field"><label>Monto pagado al registrar (0 si no ha pagado nada / es fiado)</label>
+    <input type="number" id="s_pagado" value="0" min="0" step="0.01" oninput="marcarPagoManual()"></div>
+  <div class="nota">Al guardar se descuenta automáticamente el material del inventario (si el taller usa un combo, se descuentan los materiales reales que lo forman). Si el cliente no pagó todo, podrás registrar el resto después desde la lista de "Talleres realizados" con el botón 💳 Pago.</div>
   <div id="sesionError"></div>
   <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cancelar</button>
     <button class="btn" onclick="guardarSesion('${id}')">Guardar taller</button></div>`;
   abrir('mSesion'); prevSesion(id);
+}
+function marcarPagoManual() {
+  // Si el usuario edita el monto a mano, se asume que ya no es "pago completo automático"
+  document.getElementById('s_pago_completo').checked = false;
 }
 function prevSesion(id) {
   const t = { ...DB.tipos.find(x => x.id === id) };
   t.incluye_cafe = document.getElementById('s_cafe').value === 'si';
   const per = Math.max(1, num(document.getElementById('s_per').value));
   const r = resumenTipo(t, per);
+  const totalACobrar = t.incluye_cafe ? r.totalCafe : r.totalTaller;
   document.getElementById('prevSesion').innerHTML = `
     <div class="linea"><span>Costo de materiales</span><b>${money(r.costoTotal)}</b></div>
     <div class="linea"><span>Utilidad</span><b style="color:var(--verde)">${money(r.utilidadTotal)}</b></div>
     <div class="linea final"><span>Total taller</span><b>${money(r.totalTaller)}</b></div>
     ${t.incluye_cafe ? `<div class="linea final cafe"><span>Total taller con café</span><b>${money(r.totalCafe)}</b></div>` : ''}`;
+  const pagoCompleto = document.getElementById('s_pago_completo');
+  const pagadoField = document.getElementById('s_pagado');
+  if (pagoCompleto && pagoCompleto.checked && pagadoField) {
+    pagadoField.value = totalACobrar.toFixed(2);
+  }
 }
 async function guardarSesion(id) {
   const errBox = document.getElementById('sesionError'); errBox.innerHTML = '';
@@ -606,8 +632,15 @@ async function guardarSesion(id) {
   t.incluye_cafe = document.getElementById('s_cafe').value === 'si';
   const per = Math.max(1, num(document.getElementById('s_per').value));
   const r = resumenTipo(t, per);
+  const totalACobrar = t.incluye_cafe ? r.totalCafe : r.totalTaller;
 
-  const consumo = expandirReceta(t.materiales, per); // Map(materialId -> cantidadTotal)
+  const cliente = document.getElementById('s_cli').value.trim();
+  const telefono = document.getElementById('s_tel').value.trim();
+  let pagoInicial = num(document.getElementById('s_pagado').value);
+  if (pagoInicial < 0) pagoInicial = 0;
+  if (pagoInicial > totalACobrar) pagoInicial = totalACobrar;
+
+  const consumo = expandirReceta(t.materiales, per);
 
   // 1) Verificar inventario suficiente
   for (const [materialId, cantidadReq] of consumo) {
@@ -622,10 +655,74 @@ async function guardarSesion(id) {
     const { error } = await sb.from('materials').update({ existencia: num(m.existencia) - cantidadReq }).eq('id', m.id);
     if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   }
-  // 3) Registrar la sesión
-  const { error } = await sb.from('sessions').insert({
+  // 3) Registrar la sesión (pidiendo de vuelta su id para poder ligar el pago)
+  const { data: nuevaFila, error } = await sb.from('sessions').insert({
     fecha: document.getElementById('s_fec').value || hoy(), tipo_id: t.id, tipo_nombre: t.nombre, personas: per,
-    total_taller: r.totalTaller, total_cafe: r.totalCafe, cafe_negocio: r.cafeNegocio, costo_mat: r.costoTotal, utilidad: r.utilidadTotal
+    cliente, telefono, total_taller: r.totalTaller, total_cafe: r.totalCafe, cafe_negocio: r.cafeNegocio,
+    costo_mat: r.costoTotal, utilidad: r.utilidadTotal
+  }).select().single();
+  if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
+
+  // 4) Si hubo pago inicial, registrarlo en la tabla de pagos
+  if (pagoInicial > 0) {
+    const { error: errPago } = await sb.from('pagos').insert({
+      sesion_id: nuevaFila.id, fecha: document.getElementById('s_fec').value || hoy(),
+      monto: pagoInicial, nota: 'Pago inicial'
+    });
+    if (errPago) return errBox.innerHTML = `<div class="error-box">El taller se guardó, pero hubo un problema al registrar el pago: ${esc(errPago.message)}</div>`;
+  }
+
+  await cargarTodo(); cerrar('mSesion'); go('talleres');
+}
+
+/* ---- Registrar / consultar pagos (abonos) de un taller ya realizado ---- */
+function abrirPago(sesionId) {
+  const s = DB.sesiones.find(x => x.id === sesionId);
+  if (!s) return;
+  const totalACobrar = montoACobrarSesion(s);
+  const pagosDeEsta = DB.pagos.filter(p => p.sesion_id === sesionId).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+  const historialPagos = pagosDeEsta.length
+    ? pagosDeEsta.map(p => `<div class="linea"><span>${fmtFecha(p.fecha)}${p.nota ? ' · ' + esc(p.nota) : ''}</span><b>${money(p.monto)}</b></div>`).join('')
+    : `<p class="tiny mut">Aún no hay pagos registrados para este taller.</p>`;
+  const pagado = pagadoSesion(sesionId);
+  const saldo = saldoSesion(s);
+
+  document.getElementById('boxSesion').innerHTML = `
+  <div class="modal-head"><h3>💳 Pagos — ${esc(s.tipo_nombre)}</h3>
+    <button class="cerrar" onclick="cerrar('mSesion')">✕</button></div>
+  <p class="sub" style="margin-bottom:10px">Cliente: <b>${esc(s.cliente || 'Sin nombre')}</b>${s.telefono ? ` · ${esc(s.telefono)}` : ''} · ${fmtFecha(s.fecha)}</p>
+  <div class="totales">
+    <div class="linea"><span>Total a cobrar</span><b>${money(totalACobrar)}</b></div>
+    <div class="linea"><span>Pagado hasta ahora</span><b style="color:var(--verde)">${money(pagado)}</b></div>
+    <div class="linea final"><span>Saldo pendiente</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
+  </div>
+  <h3 style="margin:18px 0 10px">Historial de pagos</h3>
+  <div class="card" style="padding:12px 16px">${historialPagos}</div>
+  ${saldo > 0 ? `
+  <h3 style="margin:18px 0 10px">Registrar nuevo abono</h3>
+  <div class="grid g2">
+    <div><label>Fecha</label><input type="date" id="p_fec" value="${hoy()}"></div>
+    <div><label>Monto</label><input type="number" id="p_monto" value="${saldo.toFixed(2)}" min="0.01" max="${saldo}" step="0.01"></div>
+    <div style="grid-column:1 / -1"><label>Nota (opcional)</label><input id="p_nota" placeholder="Ej. Segundo pago, liquidación, etc."></div>
+  </div>
+  <div id="pagoError"></div>
+  <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cerrar</button>
+    <button class="btn" onclick="guardarPago('${sesionId}')">Registrar pago</button></div>
+  ` : `<div class="nota" style="margin-top:14px">✅ Este taller ya está pagado por completo.</div>
+  <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cerrar</button></div>`}
+  `;
+  abrir('mSesion');
+}
+async function guardarPago(sesionId) {
+  const errBox = document.getElementById('pagoError'); errBox.innerHTML = '';
+  const s = DB.sesiones.find(x => x.id === sesionId);
+  const saldo = saldoSesion(s);
+  const monto = num(document.getElementById('p_monto').value);
+  if (monto <= 0) return errBox.innerHTML = `<div class="error-box">Captura un monto válido.</div>`;
+  if (monto > saldo + 0.01) return errBox.innerHTML = `<div class="error-box">Ese monto es mayor al saldo pendiente (${money(saldo)}).</div>`;
+  const { error } = await sb.from('pagos').insert({
+    sesion_id: sesionId, fecha: document.getElementById('p_fec').value || hoy(),
+    monto, nota: document.getElementById('p_nota').value.trim() || null
   });
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   await cargarTodo(); cerrar('mSesion'); go('talleres');
@@ -697,16 +794,9 @@ function prevCombo() {
   const auto = document.getElementById('c_pf_auto').checked;
   const mg = num(document.getElementById('c_mar').value);
   const pfField = document.getElementById('c_pf');
-
   pfField.disabled = auto;
   let pv;
-  if (auto) {
-    pv = co * (1 + mg / 100);
-    pfField.value = pv.toFixed(2);
-  } else {
-    pv = num(pfField.value);
-  }
-
+  if (auto) { pv = co * (1 + mg / 100); pfField.value = pv.toFixed(2); } else { pv = num(pfField.value); }
   document.getElementById('prevCombo').innerHTML = `
     <div class="linea"><span>Costo total del juego</span><b>${money(co)}</b></div>
     <div class="linea"><span>Margen real</span><b>${co > 0 ? ((pv / co - 1) * 100).toFixed(1) : 0}%</b></div>
@@ -720,11 +810,7 @@ async function guardarCombo(id) {
   if (!nombre) return errBox.innerHTML = `<div class="error-box">Ponle nombre al juego.</div>`;
   if (!materiales.length) return errBox.innerHTML = `<div class="error-box">Agrega al menos un material.</div>`;
   const auto = document.getElementById('c_pf_auto').checked;
-  const payload = {
-    ...(id ? { id } : {}), nombre, margen: num(document.getElementById('c_mar').value),
-    precio_final: auto ? 0 : num(document.getElementById('c_pf').value),
-    materiales
-  };
+  const payload = { ...(id ? { id } : {}), nombre, margen: num(document.getElementById('c_mar').value), precio_final: auto ? 0 : num(document.getElementById('c_pf').value), materiales };
   const { error } = await sb.from('combos').upsert(payload);
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   await cargarTodo(); cerrar('mCombo'); go('combos');
@@ -756,12 +842,8 @@ V.ventas = () => {
 
 function itemVenta() {
   const [tipo, id] = parseRef(document.getElementById('v_prod').value);
-  if (tipo === 'combo') {
-    const c = combo(id);
-    return { tipo, id, nombre: c.nombre, costo: comboCosto(c), sug: comboPrecio(c), materiales: c.materiales };
-  }
-  const m = mat(id);
-  return { tipo, id, nombre: m.nombre, costo: costoUnit(m), sug: precioUnitSug(m), materiales: [{ material_id: refMat(m.id), cantidad: 1 }] };
+  if (tipo === 'combo') { const c = combo(id); return { tipo, id, nombre: c.nombre, costo: comboCosto(c), sug: comboPrecio(c), materiales: c.materiales }; }
+  const m = mat(id); return { tipo, id, nombre: m.nombre, costo: costoUnit(m), sug: precioUnitSug(m), materiales: [{ material_id: refMat(m.id), cantidad: 1 }] };
 }
 function nuevaVenta() {
   if (!DB.combos.length && !DB.materiales.length) return alert('Primero registra materiales en Inventario.');
@@ -797,21 +879,16 @@ async function guardarVenta() {
   const errBox = document.getElementById('ventaError'); errBox.innerHTML = '';
   const it = itemVenta(), c = Math.max(1, num(document.getElementById('v_cant').value)), p = num(document.getElementById('v_pre').value);
   if (p <= 0) return errBox.innerHTML = `<div class="error-box">Captura un precio de venta válido.</div>`;
-
-  const consumo = expandirReceta(it.materiales, c); // Map(materialId -> cantidadTotal), resuelve combos correctamente
-
-  // 1) Verificar inventario suficiente
+  const consumo = expandirReceta(it.materiales, c);
   for (const [materialId, cantidadReq] of consumo) {
     const m = mat(materialId);
     if (!m || num(m.existencia) < cantidadReq) return errBox.innerHTML = `<div class="error-box">Inventario insuficiente de ${m ? esc(m.nombre) : 'material'}.</div>`;
   }
-  // 2) Descontar inventario
   for (const [materialId, cantidadReq] of consumo) {
     const m = mat(materialId);
     const { error } = await sb.from('materials').update({ existencia: num(m.existencia) - cantidadReq }).eq('id', m.id);
     if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   }
-  // 3) Registrar la venta
   const { error } = await sb.from('sales').insert({
     fecha: document.getElementById('v_fec').value || hoy(), tipo: it.tipo === 'combo' ? 'combo' : 'material', referencia_id: it.id,
     nombre: it.nombre, cantidad: c, precio: p, total: p * c, costo: it.costo * c
@@ -824,12 +901,33 @@ async function guardarVenta() {
    RESULTADOS
    ===================================================================== */
 V.resultados = () => {
-  const vT = DB.sesiones.reduce((t, s) => t + num(s.total_taller), 0);
+  const vT = DB.sesiones.reduce((t, s) => t + montoACobrarSesion(s), 0);
   const vV = DB.ventas.reduce((t, v) => t + num(v.total), 0);
   const cT = DB.sesiones.reduce((t, s) => t + num(s.costo_mat), 0);
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
   const cafe = DB.sesiones.reduce((t, s) => t + num(s.cafe_negocio), 0);
   const vendido = vT + vV, costo = cT + cV, util = vendido - costo;
+
+  const pendientes = DB.sesiones
+    .map(s => ({ s, saldo: saldoSesion(s) }))
+    .filter(x => x.saldo > 0)
+    .sort((a, b) => b.saldo - a.saldo);
+  const totalPorCobrar = pendientes.reduce((t, x) => t + x.saldo, 0);
+
+  const filasPendientes = pendientes.map(({ s, saldo }) => {
+    const est = estadoPagoSesion(s);
+    return `<tr>
+      <td>${fmtFecha(s.fecha)}</td>
+      <td><b>${esc(s.cliente || '—')}</b>${s.telefono ? `<span class="mut">${esc(s.telefono)}</span>` : ''}</td>
+      <td>${esc(s.tipo_nombre)}</td>
+      <td>${money(montoACobrarSesion(s))}</td>
+      <td>${money(pagadoSesion(s.id))}</td>
+      <td><b style="color:var(--rojo)">${money(saldo)}</b></td>
+      <td><span class="chip ${est.clase}">${est.label}</span></td>
+      <td><button class="btn sec mini" onclick="abrirPago('${s.id}')">💳 Pago</button></td>
+    </tr>`;
+  }).join('');
+
   return `
   <h2 class="titulo">📊 Resultados</h2><p class="sub">Lo importante, sin llenar la pantalla de indicadores.</p>
   <div class="grid g4">
@@ -843,6 +941,16 @@ V.resultados = () => {
     <div class="linea"><span>Ventas de productos y juegos</span><b>${money(vV)}</b></div>
     <div class="linea cafe"><span>☕ Café para el negocio</span><b>${money(cafe)}</b></div>
     <div class="linea final"><span>Total ingresado con café</span><b>${money(vendido + cafe)}</b></div>
+  </div>
+  <div class="card" style="margin-top:18px">
+    <h3>💰 Cuentas por cobrar</h3>
+    <div class="totales" style="margin-bottom:14px">
+      <div class="linea final"><span>Total que te deben los clientes</span><b style="color:${totalPorCobrar > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(totalPorCobrar)}</b></div>
+    </div>
+    <div class="tabla-wrap"><table>
+      <thead><tr><th>Fecha</th><th>Cliente</th><th>Taller</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <tbody>${filasPendientes || `<tr><td colspan="8" style="text-align:center;color:var(--gris);padding:22px">🎉 No debe nadie, todo está pagado.</td></tr>`}</tbody>
+    </table></div>
   </div>`;
 };
 
@@ -873,7 +981,7 @@ async function guardarConfig() {
   await cargarTodo(); go('admin');
 }
 async function respaldar() {
-  const data = { exportado_en: new Date().toISOString(), materiales: DB.materiales, tipos: DB.tipos, combos: DB.combos, sesiones: DB.sesiones, ventas: DB.ventas, settings: DB.settings };
+  const data = { exportado_en: new Date().toISOString(), materiales: DB.materiales, tipos: DB.tipos, combos: DB.combos, sesiones: DB.sesiones, ventas: DB.ventas, pagos: DB.pagos, settings: DB.settings };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
