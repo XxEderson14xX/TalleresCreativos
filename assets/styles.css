@@ -42,6 +42,7 @@ p.sub{color:var(--suave);margin-bottom:20px;font-size:14px}
 label{display:block;font-size:12px;font-weight:700;color:var(--gris);margin:10px 0 5px}
 input,select,textarea{width:100%;padding:10px 12px;border:1px solid var(--borde);border-radius:10px;font-size:14px;font-family:inherit;background:#fff;color:var(--texto)}
 input:focus,select:focus{outline:2px solid var(--rosa2)}
+input:disabled{background:#f4f6f9;color:#555}
 
 /* Botones */
 .btn{background:var(--rosa);color:#fff;border:0;padding:10px 18px;border-radius:10px;font-weight:700;cursor:pointer;font-size:14px}
@@ -49,7 +50,7 @@ input:focus,select:focus{outline:2px solid var(--rosa2)}
 .btn.sec{background:#ede9fe;color:var(--morado2)}
 .btn.mini{padding:6px 12px;font-size:12px}
 .btn.rojo{background:var(--rojobg);color:var(--rojo)}
-.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn:disabled{opacity:.55;cursor:not-allowed}
 
 /* Toolbar (filtros) */
 .toolbar{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
@@ -87,7 +88,7 @@ tr:last-child td{border-bottom:0}
 .tiny{font-size:12px}
 .field{margin:10px 0}
 
-/* Filas de material dinámicas */
+/* Filas de material dinámicas (usadas en Combos) */
 .filaMat{display:grid;grid-template-columns:2fr 90px 90px 110px 40px;gap:8px;align-items:end;margin-bottom:8px}
 
 @media(max-width:900px){
