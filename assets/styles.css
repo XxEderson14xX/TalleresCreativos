@@ -51,15 +51,20 @@ input:focus,select:focus{outline:2px solid var(--rosa2)}
 .btn.rojo{background:var(--rojobg);color:var(--rojo)}
 .btn:disabled{opacity:.6;cursor:not-allowed}
 
+/* Toolbar (filtros) */
+.toolbar{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+.toolbar > div{min-width:150px}
+
 /* Tablas */
 .tabla-wrap{width:100%;overflow-x:auto;border-radius:12px;border:1px solid var(--borde)}
 table{width:100%;border-collapse:collapse;min-width:760px;background:#fff}
 th{background:var(--morado);color:#fff;text-align:left;padding:12px;font-size:13px;white-space:nowrap}
 td{padding:11px 12px;border-bottom:1px solid #f1f5f9;font-size:14px;vertical-align:middle}
 tr:last-child td{border-bottom:0}
-.chip{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.chip{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
 .ok{background:var(--verdebg);color:var(--verde)}
 .bajo{background:var(--rojobg);color:var(--rojo)}
+.warn{background:var(--amarillobg);color:#9a6d00}
 .mut{color:var(--gris);font-size:12px;display:block}
 
 /* Modal */
@@ -79,6 +84,8 @@ tr:last-child td{border-bottom:0}
 .linea.cafe{color:#92400e}
 .nota{background:var(--amarillobg);border-radius:12px;padding:12px 14px;font-size:13px;margin-top:14px;color:#78350f}
 .error-box{background:var(--rojobg);color:var(--rojo);border-radius:12px;padding:12px 14px;font-size:13px;margin-top:14px}
+.tiny{font-size:12px}
+.field{margin:10px 0}
 
 /* Filas de material dinámicas */
 .filaMat{display:grid;grid-template-columns:2fr 90px 90px 110px 40px;gap:8px;align-items:end;margin-bottom:8px}
