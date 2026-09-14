@@ -1,35 +1,32 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v2.2.0
+   TALLERES CREATIVOS · v2.3.0
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
+   NOVEDAD v2.3.0 — SEPARACIÓN CLARA DE "TU DINERO" VS "CAFÉ":
+   Antes, el monto total de cada participante mezclaba en un solo
+   número el precio del taller (tu ingreso) y el café (dinero que es
+   para la cafetería, no para ti). Esto hacía confuso saber cuánto te
+   corresponde a ti y cuánto a la cafetería, tanto al inscribir a
+   alguien, como en la cuenta de pago, como en Resultados.
+
+   Ahora, en TODOS lados donde aparece dinero, se desglosa siempre:
+     🎨 Talleres (tuyo)  +  ☕ Café (para la cafetería)  =  Total a cobrar
+   - "VENDIDO" / utilidad / margen se calculan SOLO con lo tuyo
+     (talleres + ventas sueltas), sin mezclar el café.
+   - El café se muestra siempre aparte, claramente etiquetado.
+   - El "Total a cobrar" (lo que el cliente paga en efectivo) sigue
+     siendo la suma de ambos, porque es el dinero real que se cobra,
+     aunque una parte no se quede contigo.
+
    "Talleres" funciona en 3 niveles:
-
-   1) 🎁 Juegos/Combos = el catálogo de "qué taller se puede hacer"
-      (ej. "Taller Tetera", "Taller Cerámica"). Aquí se definen
-      materiales, margen y precio — se configura una sola vez.
-
-   2) 🎨 Taller (evento que se agenda) = Nombre, Fecha, Horario, Cupo
-      y Duración estimada. Nada de materiales ni clientes aquí.
-
-   3) 👤 Participantes, agrupados en 💳 Cuentas de pago:
-      - Cada persona que se inscribe puede PAGAR SOLA (su propia cuenta,
-        por defecto) o UNIRSE a la cuenta de alguien que ya está en el
-        mismo taller, si vinieron juntos (ej. Juan y Belem comparten
-        cuenta y saldo; Eder, que llegó por su cuenta, tiene la suya).
-      - Cada participante puede elegir uno o VARIOS talleres/combos, y
-        de cada uno indicar la CANTIDAD (ej. 2 juegos de "Taller
-        Tazas"), no solo una vez.
-      - El café es una sola opción por persona (no por cada taller).
-
-   El dinero se maneja por CUENTA (no por todo el taller completo): un
-   total, un saldo y un anticipo (50% automático) por cada grupo de
-   pago independiente dentro del mismo taller.
-
-   Al agregar un participante se descuenta de inmediato el inventario
-   según los materiales de TODOS los talleres que eligió (multiplicados
-   por su cantidad); al quitarlo, se restaura todo junto.
+   1) 🎁 Juegos/Combos = catálogo de "qué taller se puede hacer"
+      (materiales, margen, precio). Se configura una sola vez.
+   2) 🎨 Taller (evento) = Nombre, Fecha, Horario, Cupo, Duración.
+   3) 👤 Participantes, agrupados en 💳 Cuentas de pago: cada persona
+      puede pagar sola o compartir cuenta con quien vino con ella;
+      puede elegir uno o varios talleres, cada uno con su cantidad.
 
    (Se conservan las correcciones de versiones anteriores: contenido de
    combos, precio sugerido automático con casilla, y el precio de un
@@ -118,6 +115,14 @@ function sumarMapas(...mapas) {
 /* ---------------------------------------------------------------------
    PARTICIPANTES: cada quien puede elegir varios talleres, cada uno con
    su propia cantidad (ej. 2 juegos de "Taller Tazas").
+
+   IMPORTANTE (v2.3.0): el dinero de un participante siempre se separa
+   en dos partes bien distintas:
+     - "talleres" (precioTotalTalleresParticipante) = lo que es TUYO,
+       el ingreso real del negocio por los talleres que hizo.
+     - "cafe_monto" = dinero que se cobra pero es PARA LA CAFETERÍA,
+       no es ingreso del negocio de talleres.
+   monto_total = talleres + café (es el total que el cliente paga).
    --------------------------------------------------------------------- */
 function talleresDeParticipante(participanteId) {
   return DB.participanteTalleres.filter(t => t.participante_id === participanteId);
@@ -132,7 +137,7 @@ function nombresTalleresTexto(participanteId) {
 function costoTotalParticipante(participanteId) {
   return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.costo_taller) * num(x.cantidad), 0);
 }
-/** Precio total (venta) de TODOS los talleres elegidos por un participante (ya multiplicado por cantidad). */
+/** Precio total (venta) SOLO de los talleres elegidos por un participante — esto es lo TUYO, sin café. */
 function precioTotalTalleresParticipante(participanteId) {
   return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.precio_taller) * num(x.cantidad), 0);
 }
@@ -145,6 +150,7 @@ function consumoDeParticipante(participanteId) {
 /* ---------------------------------------------------------------------
    CUENTAS: un grupo de pago dentro de un taller. Por defecto cada
    participante es su propia cuenta; si vienen juntos, comparten una.
+   Cada cuenta también se desglosa en Talleres (tuyo) + Café (cafetería).
    --------------------------------------------------------------------- */
 function cuentasDeReserva(reservaId) {
   return DB.cuentas.filter(c => c.reserva_id === reservaId).sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
@@ -156,6 +162,15 @@ function titularDeCuenta(cuentaId) {
   const ps = participantesDeCuenta(cuentaId);
   return ps.find(p => p.es_titular) || ps[0] || null;
 }
+/** Subtotal de la cuenta que es TUYO (solo talleres, sin café). */
+function talleresTotalCuenta(cuentaId) {
+  return participantesDeCuenta(cuentaId).reduce((t, p) => t + precioTotalTalleresParticipante(p.id), 0);
+}
+/** Subtotal de la cuenta que es PARA LA CAFETERÍA (no es tuyo). */
+function cafeTotalCuenta(cuentaId) {
+  return participantesDeCuenta(cuentaId).reduce((t, p) => t + num(p.cafe_monto), 0);
+}
+/** Total a cobrar de la cuenta (talleres + café, lo que el cliente paga en efectivo). */
 function totalCuenta(cuentaId) { return participantesDeCuenta(cuentaId).reduce((t, p) => t + num(p.monto_total), 0); }
 function pagadoCuenta(cuentaId) { return DB.pagos.filter(p => p.cuenta_id === cuentaId).reduce((t, p) => t + num(p.monto), 0); }
 function saldoCuenta(cuentaId) { const s = totalCuenta(cuentaId) - pagadoCuenta(cuentaId); return s > 0.004 ? s : 0; }
@@ -285,24 +300,25 @@ const V = {};
    INICIO
    ===================================================================== */
 V.inicio = () => {
-  const vT = DB.participantes.reduce((t, p) => t + num(p.monto_total), 0);
+  // "Vendido" = SOLO lo tuyo: talleres (sin café) + ventas sueltas.
+  const vTalleres = DB.participantes.reduce((t, p) => t + precioTotalTalleresParticipante(p.id), 0);
   const vV = DB.ventas.reduce((t, v) => t + num(v.total), 0);
   const cT = DB.participantes.reduce((t, p) => t + costoTotalParticipante(p.id), 0);
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
   const cafeTotal = DB.participantes.reduce((t, p) => t + num(p.cafe_monto), 0);
-  const vendido = vT + vV, costo = cT + cV;
+  const vendido = vTalleres + vV, costo = cT + cV;
   const bajo = DB.materiales.filter(m => num(m.existencia) <= num(m.minimo)).length;
   const porCobrar = DB.cuentas.reduce((t, c) => t + saldoCuenta(c.id), 0);
   return `
-  <h2 class="titulo">Hola 👋</h2><p class="sub">Resumen rápido del negocio.</p>
+  <h2 class="titulo">Hola 👋</h2><p class="sub">Resumen rápido del negocio. El café se cobra junto con el taller, pero es dinero de la cafetería: no se cuenta como tu venta.</p>
   <div class="grid g4">
-    <div class="kpi"><small>VENDIDO</small><b>${money(vendido)}</b></div>
+    <div class="kpi"><small>VENDIDO (TUYO)</small><b>${money(vendido)}</b></div>
     <div class="kpi"><small>COSTO MATERIAL</small><b>${money(costo)}</b></div>
     <div class="kpi"><small>UTILIDAD</small><b>${money(vendido - costo)}</b></div>
-    <div class="kpi"><small>☕ CAFÉ (NEGOCIO)</small><b>${money(cafeTotal)}</b></div>
+    <div class="kpi" style="background:#fff9e9"><small>☕ CAFÉ (PARA LA CAFETERÍA)</small><b style="color:#92400e">${money(cafeTotal)}</b></div>
   </div>
   <div class="grid g4" style="margin-top:14px">
-    <div class="kpi" style="${porCobrar > 0 ? 'background:#fff5d8' : ''}"><small>POR COBRAR (CUENTAS)</small><b style="${porCobrar > 0 ? 'color:#9a6d00' : ''}">${money(porCobrar)}</b></div>
+    <div class="kpi" style="${porCobrar > 0 ? 'background:#fff5d8' : ''}"><small>POR COBRAR (CUENTAS, INCLUYE CAFÉ)</small><b style="${porCobrar > 0 ? 'color:#9a6d00' : ''}">${money(porCobrar)}</b></div>
   </div>
   <div class="card" style="margin-top:18px"><h3>Estado del inventario</h3>
     ${bajo ? `<p style="color:var(--rojo);font-weight:700">⚠ ${bajo} material(es) en stock bajo.</p>`
@@ -606,7 +622,7 @@ V.talleres = () => {
       <button class="btn sec mini" style="align-self:flex-end" onclick="quitarFiltroInscripciones()">Quitar filtro</button>
     </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Nombre del taller</th><th>Fecha</th><th>Cuentas / participantes</th><th>Cupo</th><th>Duración</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <thead><tr><th>Nombre del taller</th><th>Fecha</th><th>Cuentas / participantes</th><th>Cupo</th><th>Duración</th><th>Total (con café)</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
       <tbody>${filas || `<tr><td colspan="10" style="text-align:center;color:var(--gris);padding:26px">Aún no hay talleres creados${filtroInscripciones.desde || filtroInscripciones.hasta ? ' en ese rango de fechas' : ''}.</td></tr>`}</tbody>
     </table></div>
   </div>
@@ -712,6 +728,8 @@ function gestionarInscripcion(id) {
   const bloquesCuentas = cuentas.map(c => {
     const ps = participantesDeCuenta(c.id);
     if (!ps.length) return ''; // por seguridad, no mostrar cuentas vacías
+    const subtotalTalleres = talleresTotalCuenta(c.id);
+    const subtotalCafe = cafeTotalCuenta(c.id);
     const total = totalCuenta(c.id), pagado = pagadoCuenta(c.id), saldo = saldoCuenta(c.id);
     const est = estadoPagoCuenta(c.id);
     const anticipo = total / 2;
@@ -723,20 +741,22 @@ function gestionarInscripcion(id) {
         <span class="chip ${est.clase}">${est.label}</span>
       </div>
       <div class="tabla-wrap" style="margin-top:10px"><table>
-        <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller(es)</th><th>Café</th><th>Monto</th><th></th></tr></thead>
+        <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller(es)</th><th>🎨 Subtotal taller</th><th>☕ Café</th><th></th></tr></thead>
         <tbody>${ps.map(p => `<tr>
           <td><b>${esc(p.nombre)}</b></td>
           <td>${p.telefono ? esc(p.telefono) : '<span class="mut">—</span>'}</td>
           <td>${nombresTalleresTexto(p.id)}</td>
-          <td>${p.incluye_cafe ? '☕ Sí' : 'No'}</td>
-          <td><b>${money(p.monto_total)}</b></td>
+          <td><b>${money(precioTotalTalleresParticipante(p.id))}</b></td>
+          <td>${p.incluye_cafe ? `<span style="color:#92400e">${money(p.cafe_monto)}</span>` : '<span class="mut">No</span>'}</td>
           <td><button class="btn rojo mini" onclick="quitarParticipante('${p.id}','${id}')">✕</button></td>
         </tr>`).join('')}</tbody>
       </table></div>
       <div class="totales" style="margin-top:10px">
-        <div class="linea"><span>Total de esta cuenta</span><b>${money(total)}</b></div>
-        <div class="linea"><span>Pagado</span><b style="color:var(--verde)">${money(pagado)}</b></div>
-        <div class="linea final"><span>Saldo</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
+        <div class="linea"><span>🎨 Talleres (tuyo)</span><b>${money(subtotalTalleres)}</b></div>
+        <div class="linea cafe"><span>☕ Café (para la cafetería)</span><b>${money(subtotalCafe)}</b></div>
+        <div class="linea final"><span>Total a cobrar</span><b>${money(total)}</b></div>
+        <div class="linea" style="margin-top:6px"><span>Pagado</span><b style="color:var(--verde)">${money(pagado)}</b></div>
+        <div class="linea final"><span>Saldo pendiente</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
       </div>
       ${saldo > 0 ? `
       <div class="grid g2" style="margin-top:10px">
@@ -766,6 +786,7 @@ function gestionarInscripcion(id) {
     <button class="btn sec mini" style="margin-left:8px" onclick="cerrar('mSesion');nuevaInscripcion('${id}')">✏️ Editar datos</button></p>
 
   <h3 style="margin:16px 0 10px">Cuentas de pago</h3>
+  <p class="tiny mut" style="margin-bottom:10px">🎨 = ingreso del taller (tuyo) · ☕ = dinero para la cafetería (no es tuyo).</p>
   ${bloquesCuentas || '<p class="tiny mut">Aún no hay participantes.</p>'}
 
   ${hayCupo(r) ? `
@@ -784,7 +805,7 @@ function gestionarInscripcion(id) {
     ${DB.combos.length ? `<button class="btn sec mini" type="button" onclick="document.getElementById('pp_talleres_lista').insertAdjacentHTML('beforeend', filaTaller({}));actualizarTotalNuevoParticipante()">＋ Agregar otro taller</button>` : '<p class="tiny mut">No hay juegos/combos creados todavía. Ve a 🎁 Juegos/Combos y crea al menos uno.</p>'}
 
     <label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:12px">
-      <input type="checkbox" id="pp_cafe" onchange="actualizarTotalNuevoParticipante()" style="width:auto"> Incluye café (${money(DB.settings.cafe_precio || CAFE_DEFAULT)})
+      <input type="checkbox" id="pp_cafe" onchange="actualizarTotalNuevoParticipante()" style="width:auto"> ☕ Incluye café (${money(DB.settings.cafe_precio || CAFE_DEFAULT)}, es para la cafetería)
     </label>
     <div class="totales" id="pp_total_preview" style="margin-top:10px"></div>
     <div id="participanteError"></div>
@@ -796,7 +817,7 @@ function gestionarInscripcion(id) {
   actualizarTotalNuevoParticipante();
 }
 
-/** Recalcula en vivo el total del participante que se está por agregar (suma de talleres × cantidad + café). */
+/** Recalcula en vivo el total del participante que se está por agregar, siempre desglosado: talleres (tuyo) + café (cafetería). */
 function actualizarTotalNuevoParticipante() {
   const preview = document.getElementById('pp_total_preview');
   if (!preview) return;
@@ -816,9 +837,11 @@ function actualizarTotalNuevoParticipante() {
   const cafe = cafeChk ? cafeChk.checked : false;
   const cafeMonto = cafe ? num(DB.settings.cafe_precio || CAFE_DEFAULT) : 0;
   preview.innerHTML = `
-    ${detalle.join('')}
-    ${cafe ? `<div class="linea cafe"><span>☕ Café</span><b>${money(cafeMonto)}</b></div>` : ''}
-    <div class="linea final"><span>Total de este participante</span><b>${money(totalTalleres + cafeMonto)}</b></div>`;
+    <p class="tiny mut" style="margin-bottom:4px">🎨 Talleres (tuyo):</p>
+    ${detalle.join('') || '<p class="tiny mut">Ninguno seleccionado aún.</p>'}
+    <div class="linea" style="margin-top:6px"><span><b>Subtotal talleres (tuyo)</b></span><b>${money(totalTalleres)}</b></div>
+    <div class="linea cafe"><span>☕ Café (para la cafetería)</span><b>${money(cafeMonto)}</b></div>
+    <div class="linea final"><span>Total a cobrarle</span><b>${money(totalTalleres + cafeMonto)}</b></div>`;
 }
 
 async function guardarParticipante(reservaId) {
@@ -1010,12 +1033,14 @@ async function guardarVenta() {
    RESULTADOS
    ===================================================================== */
 V.resultados = () => {
-  const vT = DB.participantes.reduce((t, p) => t + num(p.monto_total), 0);
+  // "Talleres" y "Vendido" SOLO reflejan lo tuyo (sin café).
+  const vTalleres = DB.participantes.reduce((t, p) => t + precioTotalTalleresParticipante(p.id), 0);
   const cT = DB.participantes.reduce((t, p) => t + costoTotalParticipante(p.id), 0);
   const cafeTotal = DB.participantes.reduce((t, p) => t + num(p.cafe_monto), 0);
   const vV = DB.ventas.reduce((t, v) => t + num(v.total), 0);
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
-  const vendido = vT + vV, costo = cT + cV, util = vendido - costo;
+  const vendido = vTalleres + vV, costo = cT + cV, util = vendido - costo;
+  const totalCobradoConCafe = vendido + cafeTotal;
 
   const pendientes = DB.cuentas
     .map(c => ({ c, saldo: saldoCuenta(c.id) }))
@@ -1031,6 +1056,8 @@ V.resultados = () => {
       <td>${r ? fmtFecha(r.fecha) : '—'}</td>
       <td><b>${esc(ps[0].nombre)}</b>${ps.length > 1 ? `<span class="mut">+${ps.length - 1} más</span>` : ''}${ps[0].telefono ? `<span class="mut">${esc(ps[0].telefono)}</span>` : ''}</td>
       <td>${r && r.nombre ? esc(r.nombre) : '—'}</td>
+      <td>${money(talleresTotalCuenta(c.id))}</td>
+      <td>${money(cafeTotalCuenta(c.id))}</td>
       <td>${money(totalCuenta(c.id))}</td>
       <td>${money(pagadoCuenta(c.id))}</td>
       <td><b style="color:var(--rojo)">${money(saldo)}</b></td>
@@ -1040,28 +1067,29 @@ V.resultados = () => {
   }).join('');
 
   return `
-  <h2 class="titulo">📊 Resultados</h2><p class="sub">Lo importante, sin llenar la pantalla de indicadores.</p>
+  <h2 class="titulo">📊 Resultados</h2><p class="sub">Todo lo que aparece aquí es SOLO tu ingreso real (talleres + ventas). El café se muestra aparte porque ese dinero es para la cafetería, no para ti.</p>
   <div class="grid g4">
-    <div class="kpi"><small>VENDIDO</small><b>${money(vendido)}</b></div>
+    <div class="kpi"><small>VENDIDO (TUYO)</small><b>${money(vendido)}</b></div>
     <div class="kpi"><small>COSTO DE MATERIALES</small><b>${money(costo)}</b></div>
     <div class="kpi"><small>UTILIDAD</small><b>${money(util)}</b></div>
     <div class="kpi"><small>MARGEN</small><b>${vendido > 0 ? (util / vendido * 100).toFixed(1) : 0}%</b></div>
   </div>
   <div class="card" style="margin-top:18px"><h3>Desglose</h3>
-    <div class="linea"><span>Talleres</span><b>${money(vT)}</b></div>
-    <div class="linea"><span>Ventas de productos y juegos</span><b>${money(vV)}</b></div>
-    <div class="linea cafe"><span>☕ Café para el negocio</span><b>${money(cafeTotal)}</b></div>
-    <div class="linea final"><span>Total ingresado</span><b>${money(vendido)}</b></div>
+    <div class="linea"><span>🎨 Talleres (tuyo, sin café)</span><b>${money(vTalleres)}</b></div>
+    <div class="linea"><span>🛍️ Ventas de productos y juegos (tuyo)</span><b>${money(vV)}</b></div>
+    <div class="linea final"><span>Total ingresado (tuyo)</span><b>${money(vendido)}</b></div>
+    <div class="linea cafe" style="margin-top:10px"><span>☕ Café cobrado (es para la cafetería, NO es tuyo)</span><b>${money(cafeTotal)}</b></div>
+    <div class="linea final"><span>Total cobrado en efectivo (tuyo + café)</span><b>${money(totalCobradoConCafe)}</b></div>
   </div>
   <div class="card" style="margin-top:18px">
     <h3>💰 Cuentas por cobrar</h3>
-    <p class="tiny mut" style="margin-bottom:10px">Cada cuenta es un grupo de pago independiente (una persona sola, o varias que vinieron juntas y decidieron compartir cuenta).</p>
+    <p class="tiny mut" style="margin-bottom:10px">Cada cuenta es un grupo de pago independiente. El saldo incluye café, porque es dinero que falta cobrar en efectivo (aunque una parte sea para la cafetería).</p>
     <div class="totales" style="margin-bottom:14px">
-      <div class="linea final"><span>Total que te deben</span><b style="color:${totalPorCobrar > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(totalPorCobrar)}</b></div>
+      <div class="linea final"><span>Total que te deben (incluye café)</span><b style="color:${totalPorCobrar > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(totalPorCobrar)}</b></div>
     </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Fecha</th><th>Cuenta (titular)</th><th>Taller</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
-      <tbody>${filasPendientes || `<tr><td colspan="8" style="text-align:center;color:var(--gris);padding:22px">🎉 No debe nadie, todo está pagado.</td></tr>`}</tbody>
+      <thead><tr><th>Fecha</th><th>Cuenta (titular)</th><th>Taller</th><th>🎨 Talleres</th><th>☕ Café</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <tbody>${filasPendientes || `<tr><td colspan="10" style="text-align:center;color:var(--gris);padding:22px">🎉 No debe nadie, todo está pagado.</td></tr>`}</tbody>
     </table></div>
   </div>`;
 };
@@ -1076,7 +1104,7 @@ V.admin = () => `
       <button class="btn" onclick="editarCombo()">＋ Crear juego / taller</button></div>
     <div class="card"><h3>📦 Materiales</h3><p class="sub">Existencia, unidad, costo, margen y mínimo.</p>
       <button class="btn" onclick="editarMat()">＋ Material</button></div>
-    <div class="card"><h3>☕ Café</h3><p class="sub">Precio del café por persona.</p>
+    <div class="card"><h3>☕ Café</h3><p class="sub">Precio del café por persona (dinero que va para la cafetería, no para el negocio de talleres).</p>
       <label>Precio del café</label><input type="number" id="cfgCafe" value="${num(DB.settings.cafe_precio || CAFE_DEFAULT)}">
       <button class="btn" style="margin-top:10px" onclick="guardarConfig()">Guardar</button></div>
     <div class="card"><h3>💾 Respaldo</h3><p class="sub">Descarga toda tu información en un archivo JSON.</p>
