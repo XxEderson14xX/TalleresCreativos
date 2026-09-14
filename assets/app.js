@@ -1,10 +1,29 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v1.0.0
+   TALLERES CREATIVOS · v1.2.0
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
-   (cálculos, pantallas, modales) es JavaScript plano, igual de simple
-   que la versión anterior que ya conocías, solo que ahora conectado
-   a la nube en vez de a este equipo.
+   (cálculos, pantallas, modales) es JavaScript plano.
+
+   NOVEDADES:
+   v1.1.0 - Al crear/editar un Tipo de taller, la lista de
+            "Materiales por persona" ahora también permite elegir un
+            Juego/Combo ya armado (por ejemplo "Juego Taza"), en vez
+            de tener que volver a seleccionar cada material uno por uno.
+   v1.2.0 - Los menús de materiales ahora muestran claramente el COSTO
+            (lo que a ti te cuesta) y la VENTA sugerida por separado,
+            para que no se confundan. El costo es el que se usa para
+            armar la receta de un taller/combo; el margen del propio
+            taller/combo se aplica encima de ese costo, así que es
+            normal y correcto que no coincidan (si coincidieran,
+            estarías aplicando el margen dos veces).
+          - Nuevo botón "🎨 Agregar todas las pinturas" en Talleres y
+            Combos: agrega de un clic todas las pinturas de tu
+            inventario con una cantidad base (10 ml por defecto,
+            puedes cambiar el número antes de agregarlas), y después
+            puedes ajustar cada una individualmente si necesitas más.
+          - Ya no se agrega una fila vacía de "adivinanza" al crear un
+            taller/combo nuevo: la lista empieza vacía y tú decides
+            qué agregar con los botones.
    ===================================================================== */
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -21,20 +40,69 @@ const CAFE_DEFAULT = 59;
 let DB = { materiales: [], tipos: [], combos: [], sesiones: [], ventas: [], settings: { cafe_precio: CAFE_DEFAULT } };
 
 const mat = id => DB.materiales.find(m => m.id === id);
+const combo = id => DB.combos.find(c => c.id === id);
 
 /* ---------------------------------------------------------------------
-   CÁLCULOS (mismas fórmulas que siempre)
+   REFERENCIAS "material_id" que ahora pueden apuntar a un material
+   suelto ("mat:<id>") o a un combo/juego completo ("combo:<id>").
+   Si el valor no trae prefijo (datos guardados antes de esta versión),
+   se asume que es un material suelto, para no romper nada existente.
+   --------------------------------------------------------------------- */
+function parseRef(valor) {
+  const s = String(valor ?? '');
+  const i = s.indexOf(':');
+  if (i === -1) return ['mat', s];
+  return [s.slice(0, i), s.slice(i + 1)];
+}
+
+/* ---------------------------------------------------------------------
+   CÁLCULOS (mismas fórmulas de siempre)
    --------------------------------------------------------------------- */
 const costoUnit = m => num(m.cant_adq) > 0 ? num(m.costo_adq) / num(m.cant_adq) : 0;
 const precioUnitSug = m => costoUnit(m) * (1 + num(m.margen) / 100);
 const gananciaUnit = m => precioUnitSug(m) - costoUnit(m);
 
-function costoLista(lista) {
-  return (lista || []).reduce((t, l) => { const m = mat(l.material_id); return t + (m ? costoUnit(m) * num(l.cantidad) : 0); }, 0);
-}
 function comboCosto(c) { return costoLista(c.materiales); }
 function comboPrecio(c) { const co = comboCosto(c); return num(c.precio_final) > 0 ? num(c.precio_final) : co * (1 + num(c.margen) / 100); }
 function comboGanancia(c) { return comboPrecio(c) - comboCosto(c); }
+
+/** Costo de una sola línea de receta: puede ser un material o un combo completo. */
+function costoUnitRef(ref) {
+  const [tipo, id] = parseRef(ref);
+  if (tipo === 'combo') { const c = combo(id); return c ? comboCosto(c) : 0; }
+  const m = mat(id); return m ? costoUnit(m) : 0;
+}
+
+/** Costo total de una lista de líneas de receta (materiales y/o combos). */
+function costoLista(lista) {
+  return (lista || []).reduce((t, l) => t + costoUnitRef(l.material_id) * num(l.cantidad), 0);
+}
+
+/**
+ * "Aplana" una receta que puede incluir combos en una tabla
+ * Map(materialId -> cantidad total real a descontar de inventario).
+ * Si una línea es un combo, expande sus materiales internos
+ * multiplicados por la cantidad de combos usados.
+ */
+function expandirReceta(lista, factor) {
+  const mapa = new Map();
+  for (const l of (lista || [])) {
+    const [tipo, id] = parseRef(l.material_id);
+    const cantidadLinea = num(l.cantidad) * factor;
+    if (tipo === 'combo') {
+      const c = combo(id);
+      if (!c) continue;
+      for (const sub of (c.materiales || [])) {
+        const [, subId] = parseRef(sub.material_id);
+        const subCantidad = num(sub.cantidad) * cantidadLinea;
+        mapa.set(subId, (mapa.get(subId) || 0) + subCantidad);
+      }
+    } else {
+      mapa.set(id, (mapa.get(id) || 0) + cantidadLinea);
+    }
+  }
+  return mapa;
+}
 
 function resumenTipo(t, personas) {
   const per = Math.max(1, num(personas) || 1);
@@ -254,23 +322,87 @@ async function borrarMat(id) {
 }
 
 /* ---------------------------------------------------------------------
-   Fila reutilizable "material + cantidad" (Talleres y Combos)
+   Fila reutilizable "material o combo + cantidad"
+   Usada por Talleres (materiales y combos) y por Combos (solo materiales,
+   para evitar anidar un combo dentro de otro combo).
    --------------------------------------------------------------------- */
-function opcionesMat(sel) {
-  return DB.materiales.map(m => `<option value="${m.id}" ${m.id === sel ? 'selected' : ''}>${esc(m.nombre)} (${money(costoUnit(m))}/${esc(m.unidad)})</option>`).join('');
+/** Etiqueta de un material mostrando COSTO (lo que te cuesta) y VENTA sugerida (con margen). */
+function etiquetaMaterial(m) {
+  return `${esc(m.nombre)} — costo ${money(costoUnit(m))}/${esc(m.unidad)} · venta sug. ${money(precioUnitSug(m))}/${esc(m.unidad)}`;
 }
+/** Etiqueta de un combo/juego mostrando COSTO y PRECIO DE VENTA del juego completo. */
+function etiquetaCombo(c) {
+  return `🎁 ${esc(c.nombre)} (juego) — costo ${money(comboCosto(c))} · venta ${money(comboPrecio(c))}`;
+}
+
+function opcionesSoloMateriales(sel) {
+  const [, selId] = parseRef(sel);
+  return DB.materiales.map(m => {
+    const val = `mat:${m.id}`;
+    const selected = (sel === val) || (sel === m.id) || (selId === m.id && parseRef(sel)[0] === 'mat');
+    return `<option value="${val}" ${selected ? 'selected' : ''}>${etiquetaMaterial(m)}</option>`;
+  }).join('');
+}
+
+function opcionesMaterialesYCombos(sel) {
+  const mats = DB.materiales.map(m => {
+    const val = `mat:${m.id}`;
+    const selected = (sel === val) || (sel === m.id);
+    return `<option value="${val}" ${selected ? 'selected' : ''}>${etiquetaMaterial(m)}</option>`;
+  }).join('');
+  const opcionesCombo = DB.combos.map(c => {
+    const val = `combo:${c.id}`;
+    const selected = sel === val;
+    return `<option value="${val}" ${selected ? 'selected' : ''}>${etiquetaCombo(c)}</option>`;
+  }).join('');
+  if (!opcionesCombo) return mats;
+  return `<optgroup label="📦 Materiales (costo de fabricación)">${mats}</optgroup><optgroup label="🎁 Juegos / Combos">${opcionesCombo}</optgroup>`;
+}
+
 function filaMat(prefix, l = {}) {
+  const opciones = prefix === 't' ? opcionesMaterialesYCombos(l.material_id) : opcionesSoloMateriales(l.material_id);
+  const cambia = prefix === 't' ? 'prevTipo' : 'prevCombo';
   return `<div class="filaMat">
-    <div><label>Material</label><select class="${prefix}m" onchange="${prefix === 't' ? 'prevTipo' : 'prevCombo'}()">${opcionesMat(l.material_id)}</select></div>
-    <div><label>Cantidad</label><input type="number" class="${prefix}q" value="${l.cantidad ?? 1}" oninput="${prefix === 't' ? 'prevTipo' : 'prevCombo'}()"></div>
+    <div><label>${prefix === 't' ? 'Material o juego/combo' : 'Material'}</label><select class="${prefix}m" onchange="${cambia}()">${opciones}</select></div>
+    <div><label>Cantidad</label><input type="number" class="${prefix}q" value="${l.cantidad ?? 1}" oninput="${cambia}()"></div>
     <div></div><div></div>
-    <div><button class="btn rojo mini" onclick="this.closest('.filaMat').remove();${prefix === 't' ? 'prevTipo' : 'prevCombo'}()">✕</button></div>
+    <div><button class="btn rojo mini" onclick="this.closest('.filaMat').remove();${cambia}()">✕</button></div>
   </div>`;
 }
 function leerFilas(prefix, contenedorId) {
   return [...document.querySelectorAll(`#${contenedorId} .filaMat`)]
     .map(f => ({ material_id: f.querySelector(`.${prefix}m`).value, cantidad: num(f.querySelector(`.${prefix}q`).value) }))
     .filter(l => l.material_id && l.cantidad > 0);
+}
+
+/**
+ * Agrega de un clic todas las pinturas del inventario (categoría "Pinturas")
+ * a la receta que se está armando, con una cantidad base que tú eliges
+ * (10 ml por defecto). Si una pintura ya estaba en la lista, no la duplica.
+ * Después de agregarlas puedes editar la cantidad de cada una a mano.
+ */
+function agregarTodasPinturas(prefix, contenedorId) {
+  const pinturas = DB.materiales.filter(m => m.categoria === 'Pinturas');
+  if (!pinturas.length) {
+    alert('No tienes materiales en la categoría "Pinturas" todavía. Agrégalos primero en Inventario.');
+    return;
+  }
+  const respuesta = prompt('¿Cuántos ml de cada color quieres asignar? (podrás ajustar cada color después)', '10');
+  if (respuesta === null) return; // el usuario canceló
+  const base = num(respuesta) > 0 ? num(respuesta) : 10;
+
+  const yaPuestos = new Set(leerFilas(prefix, contenedorId).map(l => l.material_id));
+  const contenedor = document.getElementById(contenedorId);
+  let agregadas = 0;
+  pinturas.forEach(m => {
+    const val = `mat:${m.id}`;
+    if (yaPuestos.has(val)) return;
+    contenedor.insertAdjacentHTML('beforeend', filaMat(prefix, { material_id: val, cantidad: base }));
+    agregadas++;
+  });
+
+  if (prefix === 't') prevTipo(); else prevCombo();
+  if (!agregadas) alert('Ya tenías todas las pinturas agregadas en esta lista.');
 }
 
 /* =====================================================================
@@ -281,7 +413,7 @@ V.talleres = () => {
     const r = resumenTipo(t, 1);
     const cafe = num(DB.settings.cafe_precio || CAFE_DEFAULT);
     return `<tr>
-      <td><b>${esc(t.nombre)}</b><span class="mut">${(t.materiales || []).length} materiales · ${num(t.duracion)} h</span></td>
+      <td><b>${esc(t.nombre)}</b><span class="mut">${(t.materiales || []).length} componente(s) · ${num(t.duracion)} h</span></td>
       <td>${money(r.costoMat)}</td>
       <td><b>${money(r.precio)}</b></td>
       <td>${t.incluye_cafe ? `<b style="color:#92400e">${money(r.precio + cafe)}</b>` : '<span class="mut">Sin café</span>'}</td>
@@ -328,9 +460,13 @@ function editarTipo(id) {
     </select></div>
     <div><label>Personas (para ver el total del grupo)</label><input type="number" id="t_per" value="1" oninput="prevTipo()"></div>
   </div>
-  <h3 style="margin:18px 0 10px">Materiales por persona</h3>
-  <div id="t_lista">${(t.materiales && t.materiales.length ? t.materiales : [{}]).map(l => filaMat('t', l)).join('')}</div>
-  <button class="btn sec mini" onclick="document.getElementById('t_lista').insertAdjacentHTML('beforeend', filaMat('t', {}));prevTipo()">＋ Agregar material</button>
+  <h3 style="margin:18px 0 10px">Materiales o juegos/combos por persona</h3>
+  <p class="tiny mut" style="margin-bottom:8px">Puedes elegir materiales sueltos o un Juego/Combo ya armado (📦 Juegos / Combos) para no tener que volver a seleccionar cada pieza. En el menú se muestra el <b>costo</b> (lo que a ti te cuesta) y la <b>venta sugerida</b> aparte; aquí siempre se usa el costo para calcular el precio del taller.</p>
+  <div id="t_lista">${(t.materiales || []).map(l => filaMat('t', l)).join('')}</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+    <button class="btn sec mini" onclick="document.getElementById('t_lista').insertAdjacentHTML('beforeend', filaMat('t', {}));prevTipo()">＋ Agregar material o combo</button>
+    <button class="btn sec mini" onclick="agregarTodasPinturas('t','t_lista')">🎨 Agregar todas las pinturas</button>
+  </div>
   <div class="totales" id="prevTipo"></div>
   <div class="nota">☕ El café se cobra aparte a ${money(DB.settings.cafe_precio || CAFE_DEFAULT)} por persona y no se suma al costo de materiales.</div>
   <div id="tipoError"></div>
@@ -361,7 +497,7 @@ async function guardarTipo(id) {
   const nombre = document.getElementById('t_nom').value.trim();
   const materiales = leerFilas('t', 't_lista');
   if (!nombre) return errBox.innerHTML = `<div class="error-box">Ponle nombre al taller.</div>`;
-  if (!materiales.length) return errBox.innerHTML = `<div class="error-box">Agrega al menos un material.</div>`;
+  if (!materiales.length) return errBox.innerHTML = `<div class="error-box">Agrega al menos un material o combo.</div>`;
   const payload = {
     ...(id ? { id } : {}), nombre, duracion: num(document.getElementById('t_dur').value), margen: num(document.getElementById('t_mar').value),
     precio_final: num(document.getElementById('t_pf').value), incluye_cafe: document.getElementById('t_cafe').value === 'si', materiales
@@ -391,7 +527,7 @@ function nuevaSesion(id) {
       <option value="${t.incluye_cafe ? 'no' : 'si'}">${t.incluye_cafe ? 'No' : 'Sí'}</option></select></div>
   </div>
   <div class="totales" id="prevSesion"></div>
-  <div class="nota">Al guardar se descuenta automáticamente el material del inventario.</div>
+  <div class="nota">Al guardar se descuenta automáticamente el material del inventario (si el taller usa un combo, se descuentan los materiales que lo forman).</div>
   <div id="sesionError"></div>
   <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cancelar</button>
     <button class="btn" onclick="guardarSesion('${id}')">Guardar taller</button></div>`;
@@ -415,19 +551,20 @@ async function guardarSesion(id) {
   const per = Math.max(1, num(document.getElementById('s_per').value));
   const r = resumenTipo(t, per);
 
+  // Expande la receta (materiales + combos) a cantidades reales de inventario
+  const consumo = expandirReceta(t.materiales, per);
+
   // 1) Verificar inventario suficiente
-  for (const l of (t.materiales || [])) {
-    const m = mat(l.material_id);
-    const requerido = num(l.cantidad) * per;
-    if (!m || num(m.existencia) < requerido) {
+  for (const [materialId, cantidadReq] of consumo) {
+    const m = mat(materialId);
+    if (!m || num(m.existencia) < cantidadReq) {
       return errBox.innerHTML = `<div class="error-box">Inventario insuficiente de ${m ? esc(m.nombre) : 'material'}.</div>`;
     }
   }
   // 2) Descontar inventario
-  for (const l of (t.materiales || [])) {
-    const m = mat(l.material_id);
-    const nuevaExistencia = num(m.existencia) - num(l.cantidad) * per;
-    const { error } = await sb.from('materials').update({ existencia: nuevaExistencia }).eq('id', m.id);
+  for (const [materialId, cantidadReq] of consumo) {
+    const m = mat(materialId);
+    const { error } = await sb.from('materials').update({ existencia: num(m.existencia) - cantidadReq }).eq('id', m.id);
     if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   }
   // 3) Registrar la sesión
@@ -458,7 +595,7 @@ V.combos = () => {
   }).join('');
   return `
   <h2 class="titulo">🎁 Juegos / Combos</h2>
-  <p class="sub">Arma un juego con varios materiales, asígnale margen y véndelo con un solo clic. El inventario se descuenta solo.</p>
+  <p class="sub">Arma un juego con varios materiales, asígnale margen y véndelo con un solo clic. También puedes usarlo dentro de un Tipo de taller en vez de repetir material por material.</p>
   <div style="margin-bottom:16px"><button class="btn" onclick="editarCombo()">＋ Nuevo juego / combo</button></div>
   <div class="tabla-wrap"><table>
     <thead><tr><th>Juego</th><th>Contenido</th><th>Costo</th><th>Margen</th><th>Precio de venta</th><th>Ganancia</th><th>Acción</th></tr></thead>
@@ -477,8 +614,11 @@ function editarCombo(id) {
     <div><label>Precio final (opcional, 0 = usar el sugerido)</label><input type="number" id="c_pf" value="${num(c.precio_final)}" oninput="prevCombo()"></div>
   </div>
   <h3 style="margin:18px 0 10px">Materiales que lo forman</h3>
-  <div id="c_lista">${(c.materiales && c.materiales.length ? c.materiales : [{}]).map(l => filaMat('c', l)).join('')}</div>
-  <button class="btn sec mini" onclick="document.getElementById('c_lista').insertAdjacentHTML('beforeend', filaMat('c', {}));prevCombo()">＋ Agregar material</button>
+  <div id="c_lista">${(c.materiales || []).map(l => filaMat('c', l)).join('')}</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+    <button class="btn sec mini" onclick="document.getElementById('c_lista').insertAdjacentHTML('beforeend', filaMat('c', {}));prevCombo()">＋ Agregar material</button>
+    <button class="btn sec mini" onclick="agregarTodasPinturas('c','c_lista')">🎨 Agregar todas las pinturas</button>
+  </div>
   <div class="totales" id="prevCombo"></div>
   <div id="comboError"></div>
   <div class="acciones">
@@ -511,6 +651,10 @@ async function guardarCombo(id) {
   await cargarTodo(); cerrar('mCombo'); go('combos');
 }
 async function borrarCombo(id) {
+  const usadoEn = DB.tipos.filter(t => (t.materiales || []).some(l => parseRef(l.material_id)[0] === 'combo' && parseRef(l.material_id)[1] === id));
+  if (usadoEn.length) {
+    return alert(`No puedes eliminar este juego: está siendo usado en el tipo de taller "${usadoEn[0].nombre}". Quítalo primero de ese taller.`);
+  }
   if (!confirm('¿Eliminar este juego?')) return;
   const { error } = await sb.from('combos').delete().eq('id', id);
   if (error) return alert(error.message);
@@ -537,7 +681,7 @@ V.ventas = () => {
 
 function itemVenta() {
   const [tipo, id] = document.getElementById('v_prod').value.split(':');
-  if (tipo === 'combo') { const c = DB.combos.find(x => x.id === id); return { tipo, id, nombre: c.nombre, costo: comboCosto(c), sug: comboPrecio(c), materiales: c.materiales }; }
+  if (tipo === 'combo') { const c = combo(id); return { tipo, id, nombre: c.nombre, costo: comboCosto(c), sug: comboPrecio(c), materiales: c.materiales }; }
   const m = mat(id); return { tipo, id, nombre: m.nombre, costo: costoUnit(m), sug: precioUnitSug(m), materiales: [{ material_id: m.id, cantidad: 1 }] };
 }
 function nuevaVenta() {
@@ -627,7 +771,7 @@ V.resultados = () => {
 V.admin = () => `
   <h2 class="titulo">⚙️ Administración</h2><p class="sub">Configura una vez y simplifica la operación diaria.</p>
   <div class="grid g2">
-    <div class="card"><h3>🎨 Tipos de taller</h3><p class="sub">Materiales por persona, margen, precio y café.</p>
+    <div class="card"><h3>🎨 Tipos de taller</h3><p class="sub">Materiales o combos por persona, margen, precio y café.</p>
       <button class="btn" onclick="editarTipo()">＋ Crear tipo</button></div>
     <div class="card"><h3>🎁 Juegos / combos</h3><p class="sub">Conjuntos con costo, margen y ganancia propia.</p>
       <button class="btn" onclick="editarCombo()">＋ Crear juego</button></div>
