@@ -1,10 +1,30 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v1.4.0
+   TALLERES CREATIVOS · v1.4.1
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
-   NOVEDADES DE ESTA VERSIÓN (v1.4.0):
+   NOVEDAD v1.4.1 (CORRECCIÓN IMPORTANTE):
+   - Cuando un Taller (o Combo) usa un Juego/Combo ya armado como
+     ingrediente, antes se tomaba el COSTO CRUDO interno de ese combo
+     (lo que a ti te cuesta fabricarlo), en vez de su PRECIO DE VENTA
+     ya calculado. Esto hacía que, al poner margen 0% en el Taller
+     nuevo, el precio sugerido cayera al costo puro y se perdiera toda
+     la ganancia que ese combo ya traía incorporada.
+     Ejemplo real: combo "Taller Azucarera" (costo $65.54, venta
+     $110.00) + combo "Taller Juego Tazas" (costo $59.54, venta
+     $130.00) usados en un Taller nuevo con margen 0% mostraban precio
+     sugerido = $125.07 (la suma de costos) en vez de $240.00 (la suma
+     de sus precios de venta). Ya corregido: ahora un combo aporta su
+     PRECIO DE VENTA a la receta que lo contiene, y cualquier margen
+     que le pongas al Taller se suma encima de eso.
+   - Se agregó una advertencia visible (⚠) cuando el margen quede en
+     0%, para detectar a tiempo si fue sin querer.
+   (Los materiales sueltos NO cambiaron: siguen aportando su costo,
+   ya que un material no tiene una "venta" propia hasta que se
+   incorpora a un producto final.)
+
+   NOVEDADES DE VERSIONES ANTERIORES (v1.4.0):
    - NUEVO: cada taller registrado ahora guarda Cliente y Teléfono
      (opcional), para saber de quién es cada taller.
    - NUEVO: sistema de pagos/abonos. Al registrar un taller indicas si
@@ -64,9 +84,22 @@ const costoUnit = m => num(m.cant_adq) > 0 ? num(m.costo_adq) / num(m.cant_adq) 
 const precioUnitSug = m => costoUnit(m) * (1 + num(m.margen) / 100);
 const gananciaUnit = m => precioUnitSug(m) - costoUnit(m);
 
+/**
+ * Valor que aporta una línea de receta al costo total del Taller/Combo
+ * que la contiene.
+ * - Si es un MATERIAL suelto: se usa su costo de adquisición (no tiene
+ *   margen propio todavía, así que no hay nada que "perder").
+ * - Si es un JUEGO/COMBO ya armado: se usa su PRECIO DE VENTA (no su
+ *   costo interno crudo). Un combo ya es un producto terminado con su
+ *   propia ganancia calculada; si aquí se usara su costo crudo, esa
+ *   ganancia desaparecería en cuanto lo metieras a un Taller con 0% de
+ *   margen adicional. Usando su venta, el Taller "hereda" la ganancia
+ *   que el combo ya trae, y cualquier margen extra que le pongas al
+ *   Taller se suma encima de eso.
+ */
 function costoUnitRef(ref) {
   const [tipo, id] = parseRef(ref);
-  if (tipo === 'combo') { const c = combo(id); return c ? comboCosto(c) : 0; }
+  if (tipo === 'combo') { const c = combo(id); return c ? comboPrecio(c) : 0; }
   const m = mat(id); return m ? costoUnit(m) : 0;
 }
 function costoLista(lista) {
@@ -515,7 +548,7 @@ function editarTipo(id) {
     <div><label>Personas (para ver el total del grupo)</label><input type="number" id="t_per" value="1" oninput="prevTipo()"></div>
   </div>
   <h3 style="margin:18px 0 10px">Materiales o juegos/combos por persona</h3>
-  <p class="tiny mut" style="margin-bottom:8px">Puedes elegir materiales sueltos o un Juego/Combo ya armado (🎁) para no repetir material por material. El menú muestra el costo y la venta sugerida de cada uno, aparte.</p>
+  <p class="tiny mut" style="margin-bottom:8px">Puedes elegir materiales sueltos o un Juego/Combo ya armado (🎁) para no repetir material por material. <b>Importante:</b> un material suelto aporta su <b>costo</b>; un Juego/Combo aporta su <b>precio de venta</b> (así conserva la ganancia que ya trae). Cualquier margen que pongas aquí se suma encima de eso.</p>
   <div id="t_lista">${(t.materiales || []).map(l => filaMat('t', l)).join('')}</div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
     <button class="btn sec mini" onclick="document.getElementById('t_lista').insertAdjacentHTML('beforeend', filaMat('t', {}));prevTipo()">＋ Agregar material o combo</button>
@@ -551,7 +584,8 @@ function prevTipo() {
     <div class="linea"><span>Margen real</span><b>${r.margenReal.toFixed(1)}%</b></div>
     <div class="linea"><span>Utilidad por hora estimada</span><b>${money(r.utilHora)}/h</b></div>
     <div class="linea final"><span>Total taller (${per} persona${per > 1 ? 's' : ''})</span><b>${money(r.totalTaller)}</b></div>
-    ${tTmp.incluye_cafe ? `<div class="linea final cafe"><span>Total taller con café</span><b>${money(r.totalCafe)}</b></div>` : ''}`;
+    ${tTmp.incluye_cafe ? `<div class="linea final cafe"><span>Total taller con café</span><b>${money(r.totalCafe)}</b></div>` : ''}
+    ${margen <= 0 && auto ? `<div class="error-box" style="margin-top:10px">⚠ Tu margen está en 0%: vas a vender exactamente al costo, sin ganancia. Sube el margen si no es intencional.</div>` : ''}`;
 }
 async function guardarTipo(id) {
   const errBox = document.getElementById('tipoError'); errBox.innerHTML = '';
@@ -801,7 +835,8 @@ function prevCombo() {
     <div class="linea"><span>Costo total del juego</span><b>${money(co)}</b></div>
     <div class="linea"><span>Margen real</span><b>${co > 0 ? ((pv / co - 1) * 100).toFixed(1) : 0}%</b></div>
     <div class="linea"><span>Ganancia</span><b style="color:var(--verde)">${money(pv - co)}</b></div>
-    <div class="linea final"><span>Precio de venta del juego</span><b>${money(pv)}</b></div>`;
+    <div class="linea final"><span>Precio de venta del juego</span><b>${money(pv)}</b></div>
+    ${mg <= 0 && auto ? `<div class="error-box" style="margin-top:10px">⚠ Tu margen está en 0%: vas a vender exactamente al costo, sin ganancia. Sube el margen si no es intencional.</div>` : ''}`;
 }
 async function guardarCombo(id) {
   const errBox = document.getElementById('comboError'); errBox.innerHTML = '';
