@@ -1,36 +1,35 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v2.1.0
+   TALLERES CREATIVOS · v2.2.0
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
    "Talleres" funciona en 3 niveles:
 
-   1) 🎁 Juegos/Combos (ya existía) = el catálogo de "qué taller se
-      puede hacer" (ej. "Taller Tetera", "Taller Cerámica"). Aquí SÍ
-      se definen materiales, margen y precio — se configura una sola
-      vez, no cada vez que agendas.
+   1) 🎁 Juegos/Combos = el catálogo de "qué taller se puede hacer"
+      (ej. "Taller Tetera", "Taller Cerámica"). Aquí se definen
+      materiales, margen y precio — se configura una sola vez.
 
-   2) 🎨 Taller / Nueva inscripción (el evento que se agenda) = solo
-      pide: Nombre del taller/evento, Fecha, Horario, Cupo (máximo de
-      personas) y Duración estimada. NADA de materiales ni clientes.
+   2) 🎨 Taller (evento que se agenda) = Nombre, Fecha, Horario, Cupo
+      y Duración estimada. Nada de materiales ni clientes aquí.
 
-   3) 👤 Participantes = dentro de cada taller creado, se agrega a
-      cada persona con: Nombre, Teléfono (opcional) y qué Juego(s)/
-      Combo(s) va a hacer — puede elegir UNO O VARIOS a la vez (v2.1.0:
-      antes solo permitía elegir uno; ahora Juan puede hacer, por
-      ejemplo, "Taller Tetera" + "Taller Tazas" en la misma inscripción,
-      y su monto se suma automáticamente). El café es una sola opción
-      por persona (no se repite por cada taller que elija). El primero
-      agregado queda como "titular" del evento.
+   3) 👤 Participantes, agrupados en 💳 Cuentas de pago:
+      - Cada persona que se inscribe puede PAGAR SOLA (su propia cuenta,
+        por defecto) o UNIRSE a la cuenta de alguien que ya está en el
+        mismo taller, si vinieron juntos (ej. Juan y Belem comparten
+        cuenta y saldo; Eder, que llegó por su cuenta, tiene la suya).
+      - Cada participante puede elegir uno o VARIOS talleres/combos, y
+        de cada uno indicar la CANTIDAD (ej. 2 juegos de "Taller
+        Tazas"), no solo una vez.
+      - El café es una sola opción por persona (no por cada taller).
 
-   El dinero se maneja en UNA sola cuenta compartida por todo el evento
-   (no una por persona): un total combinado, un solo saldo, y el
-   anticipo siempre es automáticamente el 50% de ese total.
+   El dinero se maneja por CUENTA (no por todo el taller completo): un
+   total, un saldo y un anticipo (50% automático) por cada grupo de
+   pago independiente dentro del mismo taller.
 
    Al agregar un participante se descuenta de inmediato el inventario
-   según los materiales de TODOS los talleres que eligió; al quitarlo,
-   se restaura todo junto.
+   según los materiales de TODOS los talleres que eligió (multiplicados
+   por su cantidad); al quitarlo, se restaura todo junto.
 
    (Se conservan las correcciones de versiones anteriores: contenido de
    combos, precio sugerido automático con casilla, y el precio de un
@@ -50,22 +49,22 @@ const CAFE_DEFAULT = 59;
 /* Caché de datos en memoria, se recarga después de cada guardado */
 let DB = {
   materiales: [], combos: [],
-  reservas: [], participantes: [], participanteTalleres: [], pagos: [],
+  reservas: [], cuentas: [], participantes: [], participanteTalleres: [], pagos: [],
   ventas: [], sesionesAntiguas: [],
   settings: { cafe_precio: CAFE_DEFAULT }
 };
 
-/* Filtro de fechas para la lista de inscripciones */
+/* Filtro de fechas para la lista de talleres */
 let filtroInscripciones = { desde: '', hasta: '' };
 
 const mat = id => DB.materiales.find(m => m.id === id);
 const combo = id => DB.combos.find(c => c.id === id);
 const reserva = id => DB.reservas.find(r => r.id === id);
+const cuenta = id => DB.cuentas.find(c => c.id === id);
 
 /* ---------------------------------------------------------------------
-   REFERENCIAS "mat:<id>" / "combo:<id>" — usadas dentro de la receta de
-   un Juego/Combo (que solo admite materiales sueltos). parseRef()
-   también acepta datos "viejos" guardados sin prefijo.
+   REFERENCIAS "mat:<id>" — usadas dentro de la receta de un Juego/Combo.
+   parseRef() también acepta datos "viejos" guardados sin prefijo.
    --------------------------------------------------------------------- */
 function parseRef(ref) {
   if (typeof ref !== 'string' || !ref) return ['mat', ''];
@@ -109,39 +108,74 @@ function expandirReceta(lista, factor) {
   });
   return mapa;
 }
+/** Suma varios Map de consumo de inventario en uno solo. */
+function sumarMapas(...mapas) {
+  const total = new Map();
+  mapas.forEach(m => { for (const [id, cant] of m) total.set(id, (total.get(id) || 0) + cant); });
+  return total;
+}
 
 /* ---------------------------------------------------------------------
-   INSCRIPCIONES Y PARTICIPANTES
+   PARTICIPANTES: cada quien puede elegir varios talleres, cada uno con
+   su propia cantidad (ej. 2 juegos de "Taller Tazas").
+   --------------------------------------------------------------------- */
+function talleresDeParticipante(participanteId) {
+  return DB.participanteTalleres.filter(t => t.participante_id === participanteId);
+}
+/** Texto legible "Taller Tetera + Taller Tazas ×2" para mostrar en tablas. */
+function nombresTalleresTexto(participanteId) {
+  const ts = talleresDeParticipante(participanteId);
+  if (!ts.length) return '<span class="mut">—</span>';
+  return ts.map(t => `${esc(t.combo_nombre)}${num(t.cantidad) > 1 ? ` ×${num(t.cantidad)}` : ''}`).join(' + ');
+}
+/** Costo total de materiales de TODOS los talleres que eligió un participante (ya multiplicado por cantidad). */
+function costoTotalParticipante(participanteId) {
+  return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.costo_taller) * num(x.cantidad), 0);
+}
+/** Precio total (venta) de TODOS los talleres elegidos por un participante (ya multiplicado por cantidad). */
+function precioTotalTalleresParticipante(participanteId) {
+  return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.precio_taller) * num(x.cantidad), 0);
+}
+/** Consumo real de inventario de un participante: junta TODOS sus talleres, cada uno ya multiplicado por su propia cantidad. */
+function consumoDeParticipante(participanteId) {
+  const mapas = talleresDeParticipante(participanteId).map(t => expandirReceta(t.materiales_snapshot || [], num(t.cantidad) || 1));
+  return sumarMapas(...(mapas.length ? mapas : [new Map()]));
+}
+
+/* ---------------------------------------------------------------------
+   CUENTAS: un grupo de pago dentro de un taller. Por defecto cada
+   participante es su propia cuenta; si vienen juntos, comparten una.
+   --------------------------------------------------------------------- */
+function cuentasDeReserva(reservaId) {
+  return DB.cuentas.filter(c => c.reserva_id === reservaId).sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
+}
+function participantesDeCuenta(cuentaId) {
+  return DB.participantes.filter(p => p.cuenta_id === cuentaId).sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
+}
+function titularDeCuenta(cuentaId) {
+  const ps = participantesDeCuenta(cuentaId);
+  return ps.find(p => p.es_titular) || ps[0] || null;
+}
+function totalCuenta(cuentaId) { return participantesDeCuenta(cuentaId).reduce((t, p) => t + num(p.monto_total), 0); }
+function pagadoCuenta(cuentaId) { return DB.pagos.filter(p => p.cuenta_id === cuentaId).reduce((t, p) => t + num(p.monto), 0); }
+function saldoCuenta(cuentaId) { const s = totalCuenta(cuentaId) - pagadoCuenta(cuentaId); return s > 0.004 ? s : 0; }
+function estadoPagoCuenta(cuentaId) {
+  const total = totalCuenta(cuentaId), pagado = pagadoCuenta(cuentaId);
+  if (total <= 0) return { label: '—', clase: '' };
+  if (pagado <= 0.004) return { label: '🔴 Pendiente', clase: 'bajo' };
+  if (pagado >= total - 0.004) return { label: '🟢 Pagado', clase: 'ok' };
+  return { label: '🟡 Parcial', clase: 'warn' };
+}
+
+/* ---------------------------------------------------------------------
+   RESERVA (taller completo) = suma de todas sus cuentas.
    --------------------------------------------------------------------- */
 function participantesDe(reservaId) {
   return DB.participantes.filter(p => p.reserva_id === reservaId).sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
 }
-/** Lista de talleres (uno o varios) que eligió un participante. */
-function talleresDeParticipante(participanteId) {
-  return DB.participanteTalleres.filter(t => t.participante_id === participanteId);
-}
-/** Texto legible "Tetera + Tazas" para mostrar en tablas. */
-function nombresTalleresTexto(participanteId) {
-  const ts = talleresDeParticipante(participanteId);
-  return ts.length ? ts.map(t => esc(t.combo_nombre)).join(' + ') : '<span class="mut">—</span>';
-}
-/** Junta los materiales (con su prefijo) de TODOS los talleres elegidos por un participante, para descontar/restaurar inventario en una sola operación. */
-function materialesCombinadosParticipante(participanteId) {
-  const ts = talleresDeParticipante(participanteId);
-  return ts.flatMap(t => t.materiales_snapshot || []);
-}
-function titularDe(reservaId) {
-  const ps = participantesDe(reservaId);
-  return ps.find(p => p.es_titular) || ps[0] || null;
-}
 function hayCupo(r) { return participantesDe(r.id).length < num(r.cupo); }
-
-/** Costo de materiales de TODOS los talleres que eligió un participante. */
-function costoTotalParticipante(participanteId) {
-  return talleresDeParticipante(participanteId).reduce((t, x) => t + num(x.costo_taller), 0);
-}
-function totalReserva(reservaId) { return participantesDe(reservaId).reduce((t, p) => t + num(p.monto_total), 0); }
-function pagadoReserva(reservaId) { return DB.pagos.filter(p => p.reserva_id === reservaId).reduce((t, p) => t + num(p.monto), 0); }
+function totalReserva(reservaId) { return cuentasDeReserva(reservaId).reduce((t, c) => t + totalCuenta(c.id), 0); }
+function pagadoReserva(reservaId) { return cuentasDeReserva(reservaId).reduce((t, c) => t + pagadoCuenta(c.id), 0); }
 function saldoReserva(reservaId) { const s = totalReserva(reservaId) - pagadoReserva(reservaId); return s > 0.004 ? s : 0; }
 function estadoPagoReserva(reservaId) {
   const total = totalReserva(reservaId), pagado = pagadoReserva(reservaId);
@@ -149,6 +183,18 @@ function estadoPagoReserva(reservaId) {
   if (pagado <= 0.004) return { label: '🔴 Pendiente', clase: 'bajo' };
   if (pagado >= total - 0.004) return { label: '🟢 Pagado', clase: 'ok' };
   return { label: '🟡 Parcial', clase: 'warn' };
+}
+/** Texto resumen para la tabla principal: nombre del titular de cada cuenta, agrupando quién viene con quién. */
+function resumenCuentasTexto(reservaId) {
+  const cuentas = cuentasDeReserva(reservaId);
+  if (!cuentas.length) return '<span class="mut">Sin participantes</span>';
+  return cuentas.map(c => {
+    const ps = participantesDeCuenta(c.id);
+    const titular = titularDeCuenta(c.id);
+    const otros = ps.filter(p => !titular || p.id !== titular.id);
+    const nombre = titular ? esc(titular.nombre) : '—';
+    return otros.length ? `<b>${nombre}</b> +${otros.length}: ${otros.map(o => esc(o.nombre)).join(', ')}` : `<b>${nombre}</b>`;
+  }).join('<br>');
 }
 
 /* =====================================================================
@@ -194,10 +240,11 @@ async function mostrarApp(session) {
    CARGA DE DATOS
    ===================================================================== */
 async function cargarTodo() {
-  const [materiales, combos, reservas, participantes, participanteTalleres, ventas, pagos, sesionesAntiguas, settingsRes] = await Promise.all([
+  const [materiales, combos, reservas, cuentas, participantes, participanteTalleres, ventas, pagos, sesionesAntiguas, settingsRes] = await Promise.all([
     sb.from('materials').select('*').order('nombre'),
     sb.from('combos').select('*').order('nombre'),
     sb.from('reservas').select('*').order('fecha', { ascending: false }),
+    sb.from('cuentas').select('*'),
     sb.from('reserva_participantes').select('*').order('created_at'),
     sb.from('participante_talleres').select('*').order('created_at'),
     sb.from('sales').select('*').order('fecha', { ascending: false }),
@@ -208,6 +255,7 @@ async function cargarTodo() {
   DB.materiales = materiales.data || [];
   DB.combos = combos.data || [];
   DB.reservas = reservas.data || [];
+  DB.cuentas = cuentas.data || [];
   DB.participantes = participantes.data || [];
   DB.participanteTalleres = participanteTalleres.data || [];
   DB.ventas = ventas.data || [];
@@ -244,7 +292,7 @@ V.inicio = () => {
   const cafeTotal = DB.participantes.reduce((t, p) => t + num(p.cafe_monto), 0);
   const vendido = vT + vV, costo = cT + cV;
   const bajo = DB.materiales.filter(m => num(m.existencia) <= num(m.minimo)).length;
-  const porCobrar = DB.reservas.reduce((t, r) => t + saldoReserva(r.id), 0);
+  const porCobrar = DB.cuentas.reduce((t, c) => t + saldoCuenta(c.id), 0);
   return `
   <h2 class="titulo">Hola 👋</h2><p class="sub">Resumen rápido del negocio.</p>
   <div class="grid g4">
@@ -254,7 +302,7 @@ V.inicio = () => {
     <div class="kpi"><small>☕ CAFÉ (NEGOCIO)</small><b>${money(cafeTotal)}</b></div>
   </div>
   <div class="grid g4" style="margin-top:14px">
-    <div class="kpi" style="${porCobrar > 0 ? 'background:#fff5d8' : ''}"><small>POR COBRAR (INSCRIPCIONES)</small><b style="${porCobrar > 0 ? 'color:#9a6d00' : ''}">${money(porCobrar)}</b></div>
+    <div class="kpi" style="${porCobrar > 0 ? 'background:#fff5d8' : ''}"><small>POR COBRAR (CUENTAS)</small><b style="${porCobrar > 0 ? 'color:#9a6d00' : ''}">${money(porCobrar)}</b></div>
   </div>
   <div class="card" style="margin-top:18px"><h3>Estado del inventario</h3>
     ${bajo ? `<p style="color:var(--rojo);font-weight:700">⚠ ${bajo} material(es) en stock bajo.</p>`
@@ -363,7 +411,7 @@ async function borrarMat(id) {
 
 /* ---------------------------------------------------------------------
    Filas "material + cantidad" reutilizadas al armar la receta de un
-   Juego/Combo (único lugar donde ahora se seleccionan materiales).
+   Juego/Combo (único lugar donde ahora se seleccionan materiales base).
    --------------------------------------------------------------------- */
 function etiquetaMaterial(m) {
   return `${esc(m.nombre)} — costo ${money(costoUnit(m))}/${esc(m.unidad)} · venta sug. ${money(precioUnitSug(m))}/${esc(m.unidad)}`;
@@ -497,14 +545,15 @@ async function guardarCombo(id) {
   await cargarTodo(); cerrar('mCombo'); go('combos');
 }
 async function borrarCombo(id) {
-  if (!confirm('¿Eliminar este juego? Si alguna inscripción ya lo usó, esa inscripción conserva su información (no se ve afectada).')) return;
+  if (!confirm('¿Eliminar este juego? Si algún taller ya lo usó, esa información se conserva (no se ve afectada).')) return;
   const { error } = await sb.from('combos').delete().eq('id', id);
   if (error) return alert(error.message);
   await cargarTodo(); cerrar('mCombo'); go('combos');
 }
 
 /* =====================================================================
-   TALLERES → INSCRIPCIONES (agenda) + PARTICIPANTES (quién y qué taller)
+   TALLERES → agenda (nombre/fecha/horario/cupo/duración) + Cuentas de
+   pago + Participantes (cada quien elige uno o varios talleres/combos)
    ===================================================================== */
 V.talleres = () => {
   const reservasFiltradas = DB.reservas.filter(r => {
@@ -515,15 +564,12 @@ V.talleres = () => {
 
   const filas = reservasFiltradas.map(r => {
     const parts = participantesDe(r.id);
-    const titular = titularDe(r.id);
-    const otros = parts.filter(p => !titular || p.id !== titular.id);
     const total = totalReserva(r.id), pagado = pagadoReserva(r.id), saldo = saldoReserva(r.id);
     const est = estadoPagoReserva(r.id);
     return `<tr>
       <td><b>${r.nombre ? esc(r.nombre) : '<span class="mut">Sin nombre</span>'}</b></td>
       <td>${fmtFecha(r.fecha)}${r.horario ? `<span class="mut">${esc(r.horario)}</span>` : ''}</td>
-      <td><b>${titular ? esc(titular.nombre) : '<span class="mut">Sin participantes</span>'}</b>
-          ${otros.length ? `<span class="mut">+${otros.length} más: ${otros.map(o => esc(o.nombre)).join(', ')}</span>` : ''}</td>
+      <td>${resumenCuentasTexto(r.id)}</td>
       <td>${parts.length}/${num(r.cupo)}</td>
       <td>${num(r.duracion)} h</td>
       <td><b>${money(total)}</b></td>
@@ -549,7 +595,7 @@ V.talleres = () => {
 
   return `
   <h2 class="titulo">📅 Talleres</h2>
-  <p class="sub">Crea el taller (fecha, horario, cupo, duración) y luego inscribe a cada participante con lo que vaya a hacer.</p>
+  <p class="sub">Crea el taller (fecha, horario, cupo, duración) y luego inscribe a cada participante con lo que vaya a hacer. Cada quien puede pagar por separado, o compartir cuenta si vino con alguien más.</p>
   <div style="margin-bottom:16px"><button class="btn" onclick="nuevaInscripcion()">＋ Nuevo taller</button></div>
 
   <div class="card">
@@ -560,7 +606,7 @@ V.talleres = () => {
       <button class="btn sec mini" style="align-self:flex-end" onclick="quitarFiltroInscripciones()">Quitar filtro</button>
     </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Nombre del taller</th><th>Fecha</th><th>Titular / participantes</th><th>Cupo</th><th>Duración</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <thead><tr><th>Nombre del taller</th><th>Fecha</th><th>Cuentas / participantes</th><th>Cupo</th><th>Duración</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
       <tbody>${filas || `<tr><td colspan="10" style="text-align:center;color:var(--gris);padding:26px">Aún no hay talleres creados${filtroInscripciones.desde || filtroInscripciones.hasta ? ' en ese rango de fechas' : ''}.</td></tr>`}</tbody>
     </table></div>
   </div>
@@ -590,7 +636,7 @@ function nuevaInscripcion(id) {
     <div><label>Cupo (máximo de personas)</label><input type="number" id="i_cupo" value="${num(r.cupo)}" min="1"></div>
     <div><label>Duración estimada (horas)</label><input type="number" id="i_dur" value="${num(r.duracion)}" min="0" step="0.5"></div>
   </div>
-  <p class="tiny mut" style="margin-top:10px">Aquí solo defines el espacio. Cada participante elegirá qué taller(es) va a hacer (Cerámica, Tetera, etc., incluso más de uno) al inscribirse, en el siguiente paso.</p>
+  <p class="tiny mut" style="margin-top:10px">Aquí solo defines el espacio. Cada participante elegirá qué taller(es) va a hacer (Cerámica, Tetera, etc., incluso más de uno o repetido) al inscribirse, y decidirá si paga solo o comparte cuenta con alguien más.</p>
   <div id="inscripcionError"></div>
   <div class="acciones">
     ${id ? `<button class="btn rojo" onclick="borrarInscripcion('${id}')">Eliminar</button>` : ''}
@@ -623,7 +669,7 @@ async function borrarInscripcion(id) {
     : '¿Eliminar este taller?';
   if (!confirm(msg)) return;
   for (const p of parts) {
-    const consumo = expandirReceta(materialesCombinadosParticipante(p.id), 1);
+    const consumo = consumoDeParticipante(p.id);
     for (const [materialId, cantidad] of consumo) {
       const m = mat(materialId);
       if (m) await sb.from('materials').update({ existencia: num(m.existencia) + cantidad }).eq('id', m.id);
@@ -636,96 +682,141 @@ async function borrarInscripcion(id) {
   go('talleres');
 }
 
-/* ---- Gestionar participantes y pagos de un taller ---- */
+/* ---------------------------------------------------------------------
+   Filas dinámicas "taller + cantidad" para que un participante elija
+   uno o varios talleres, incluso repetido (ej. 2 juegos de tazas).
+   --------------------------------------------------------------------- */
+function opcionesCombosTaller(sel) {
+  return DB.combos.map(c => `<option value="${c.id}" ${c.id === sel ? 'selected' : ''}>${esc(c.nombre)} — ${money(comboPrecio(c))}</option>`).join('');
+}
+function filaTaller(l = {}) {
+  return `<div class="filaMat">
+    <div><label>Taller</label><select class="ppt-combo" onchange="actualizarTotalNuevoParticipante()">${opcionesCombosTaller(l.combo_id)}</select></div>
+    <div><label>Cantidad</label><input type="number" class="ppt-cant" value="${l.cantidad ?? 1}" min="1" step="1" oninput="actualizarTotalNuevoParticipante()"></div>
+    <div></div><div></div>
+    <div><button type="button" class="btn rojo mini" onclick="this.closest('.filaMat').remove();actualizarTotalNuevoParticipante()">✕</button></div>
+  </div>`;
+}
+function leerFilasTalleres(contenedorId) {
+  return [...document.querySelectorAll(`#${contenedorId} .filaMat`)]
+    .map(f => ({ combo_id: f.querySelector('.ppt-combo').value, cantidad: Math.max(1, num(f.querySelector('.ppt-cant').value) || 1) }))
+    .filter(l => l.combo_id);
+}
+
+/* ---- Gestionar cuentas, participantes y pagos de un taller ---- */
 function gestionarInscripcion(id) {
   const r = reserva(id);
   if (!r) return;
-  const parts = participantesDe(id);
-  const total = totalReserva(id), pagado = pagadoReserva(id), saldo = saldoReserva(id);
-  const anticipoSugerido = total / 2;
-  const pagosDeEsta = DB.pagos.filter(p => p.reserva_id === id).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+  const cuentas = cuentasDeReserva(id);
+
+  const bloquesCuentas = cuentas.map(c => {
+    const ps = participantesDeCuenta(c.id);
+    if (!ps.length) return ''; // por seguridad, no mostrar cuentas vacías
+    const total = totalCuenta(c.id), pagado = pagadoCuenta(c.id), saldo = saldoCuenta(c.id);
+    const est = estadoPagoCuenta(c.id);
+    const anticipo = total / 2;
+    const pagosDeEsta = DB.pagos.filter(p => p.cuenta_id === c.id).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+    return `
+    <div class="card" style="border:2px solid ${saldo > 0 ? '#ffe1a8' : 'var(--verdebg)'}">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <h3 style="margin:0">💳 Cuenta de ${esc(ps[0].nombre)}${ps.length > 1 ? ` (+${ps.length - 1})` : ''}</h3>
+        <span class="chip ${est.clase}">${est.label}</span>
+      </div>
+      <div class="tabla-wrap" style="margin-top:10px"><table>
+        <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller(es)</th><th>Café</th><th>Monto</th><th></th></tr></thead>
+        <tbody>${ps.map(p => `<tr>
+          <td><b>${esc(p.nombre)}</b></td>
+          <td>${p.telefono ? esc(p.telefono) : '<span class="mut">—</span>'}</td>
+          <td>${nombresTalleresTexto(p.id)}</td>
+          <td>${p.incluye_cafe ? '☕ Sí' : 'No'}</td>
+          <td><b>${money(p.monto_total)}</b></td>
+          <td><button class="btn rojo mini" onclick="quitarParticipante('${p.id}','${id}')">✕</button></td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+      <div class="totales" style="margin-top:10px">
+        <div class="linea"><span>Total de esta cuenta</span><b>${money(total)}</b></div>
+        <div class="linea"><span>Pagado</span><b style="color:var(--verde)">${money(pagado)}</b></div>
+        <div class="linea final"><span>Saldo</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
+      </div>
+      ${saldo > 0 ? `
+      <div class="grid g2" style="margin-top:10px">
+        <div><button class="btn sec" style="width:100%" onclick="registrarAnticipoCuenta('${c.id}','${id}')" ${pagado >= anticipo - 0.004 ? 'disabled' : ''}>💰 Anticipo 50% (${money(anticipo)})</button></div>
+        <div style="display:flex;gap:8px;align-items:end">
+          <div style="flex:1"><label>Abono</label><input type="number" id="abono_${c.id}" value="${saldo.toFixed(2)}" min="0.01" max="${saldo}" step="0.01"></div>
+          <button class="btn sec mini" onclick="guardarPagoLibreCuenta('${c.id}','${id}')">Registrar</button>
+        </div>
+      </div>
+      <div id="pagoError_${c.id}"></div>` : `<div class="nota" style="margin-top:10px">✅ Cuenta pagada por completo.</div>`}
+      ${pagosDeEsta.length ? `<p class="tiny mut" style="margin-top:10px">Pagos: ${pagosDeEsta.map(p => `${fmtFecha(p.fecha)} ${money(p.monto)}`).join(' · ')}</p>` : ''}
+    </div>`;
+  }).join('');
+
+  const opcionesCuentaSelect = cuentas.filter(c => participantesDeCuenta(c.id).length).length
+    ? `<option value="nueva">🆕 Nueva cuenta (paga por separado)</option>` +
+      cuentas.filter(c => participantesDeCuenta(c.id).length).map(c => {
+        const ps = participantesDeCuenta(c.id);
+        return `<option value="${c.id}">Unirse a la cuenta de ${esc(ps[0].nombre)}${ps.length > 1 ? ` (+${ps.length - 1})` : ''}</option>`;
+      }).join('')
+    : `<option value="nueva">🆕 Nueva cuenta</option>`;
 
   document.getElementById('boxSesion').innerHTML = `
   <div class="modal-head"><h3>🎨 ${r.nombre ? esc(r.nombre) : 'Taller'} — ${fmtFecha(r.fecha)}${r.horario ? ' · ' + esc(r.horario) : ''}</h3>
     <button class="cerrar" onclick="cerrar('mSesion')">✕</button></div>
-  <p class="tiny mut">Cupo: ${parts.length}/${num(r.cupo)} · Duración estimada: ${num(r.duracion)} h
+  <p class="tiny mut">Cupo: ${participantesDe(id).length}/${num(r.cupo)} · Duración estimada: ${num(r.duracion)} h
     <button class="btn sec mini" style="margin-left:8px" onclick="cerrar('mSesion');nuevaInscripcion('${id}')">✏️ Editar datos</button></p>
 
-  <h3 style="margin:16px 0 10px">Participantes</h3>
-  <div class="tabla-wrap"><table>
-    <thead><tr><th>Nombre</th><th>Teléfono</th><th>Taller(es)</th><th>Café</th><th>Monto</th><th></th></tr></thead>
-    <tbody>${parts.length ? parts.map(p => `<tr>
-        <td><b>${esc(p.nombre)}</b>${p.es_titular ? '<span class="mut">Titular</span>' : ''}</td>
-        <td>${p.telefono ? esc(p.telefono) : '<span class="mut">—</span>'}</td>
-        <td>${nombresTalleresTexto(p.id)}</td>
-        <td>${p.incluye_cafe ? '☕ Sí' : 'No'}</td>
-        <td><b>${money(p.monto_total)}</b></td>
-        <td><button class="btn rojo mini" onclick="quitarParticipante('${p.id}','${id}')">✕</button></td>
-      </tr>`).join('') : `<tr><td colspan="6" style="text-align:center;color:var(--gris);padding:16px">Aún no hay participantes.</td></tr>`}
-    </tbody>
-  </table></div>
+  <h3 style="margin:16px 0 10px">Cuentas de pago</h3>
+  ${bloquesCuentas || '<p class="tiny mut">Aún no hay participantes.</p>'}
 
-  ${parts.length < num(r.cupo) ? `
-  <div style="margin-top:14px">
-    <h3 style="margin-bottom:10px">＋ Agregar participante</h3>
+  ${hayCupo(r) ? `
+  <div class="card" style="margin-top:16px">
+    <h3>＋ Agregar participante</h3>
     <div class="grid g2">
       <div><label>Nombre</label><input id="pp_nom" placeholder="Nombre del participante"></div>
       <div><label>Teléfono (opcional)</label><input id="pp_tel" placeholder="Ej. 722 123 4567"></div>
     </div>
-    <label style="margin-top:12px">¿Qué taller(es) va a hacer? (puede elegir más de uno)</label>
-    <div id="pp_talleres_list" class="card" style="padding:10px 14px;margin-top:4px">
-      ${DB.combos.length ? DB.combos.map(c => `<label style="display:flex;align-items:center;gap:8px;padding:6px 0;font-weight:400">
-          <input type="checkbox" class="pp_taller_chk" value="${c.id}" onchange="actualizarTotalNuevoParticipante()" style="width:auto">
-          ${esc(c.nombre)} — ${money(comboPrecio(c))}
-        </label>`).join('') : '<p class="tiny mut">No hay juegos/combos creados todavía. Ve a 🎁 Juegos/Combos y crea al menos uno.</p>'}
-    </div>
-    <label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:10px">
+    <label>¿Con quién viene?</label>
+    <select id="pp_cuenta">${opcionesCuentaSelect}</select>
+    <p class="tiny mut" style="margin:6px 0 0">Si vino junto con alguien que ya está en la lista y van a pagar juntos, elige su cuenta. Si no, deja "Nueva cuenta" para que pague por separado.</p>
+
+    <label style="margin-top:14px">¿Qué taller(es) va a hacer? (puedes agregarlo más de una vez si quiere repetirlo, ej. 2 juegos de tazas)</label>
+    <div id="pp_talleres_lista">${DB.combos.length ? filaTaller({}) : ''}</div>
+    ${DB.combos.length ? `<button class="btn sec mini" type="button" onclick="document.getElementById('pp_talleres_lista').insertAdjacentHTML('beforeend', filaTaller({}));actualizarTotalNuevoParticipante()">＋ Agregar otro taller</button>` : '<p class="tiny mut">No hay juegos/combos creados todavía. Ve a 🎁 Juegos/Combos y crea al menos uno.</p>'}
+
+    <label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:12px">
       <input type="checkbox" id="pp_cafe" onchange="actualizarTotalNuevoParticipante()" style="width:auto"> Incluye café (${money(DB.settings.cafe_precio || CAFE_DEFAULT)})
     </label>
-    <div class="totales" id="pp_total_preview" style="margin-top:10px">
-      <div class="linea final"><span>Total de este participante</span><b>$0.00</b></div>
-    </div>
+    <div class="totales" id="pp_total_preview" style="margin-top:10px"></div>
     <div id="participanteError"></div>
     <div class="acciones"><button class="btn" onclick="guardarParticipante('${id}')">＋ Agregar participante</button></div>
   </div>` : `<div class="nota" style="margin-top:14px">Cupo lleno (${num(r.cupo)}/${num(r.cupo)}). Quita a alguien o edita el cupo para agregar más.</div>`}
 
-  <h3 style="margin:20px 0 10px">💳 Pagos</h3>
-  <div class="totales">
-    <div class="linea"><span>Total del taller (todos los participantes)</span><b>${money(total)}</b></div>
-    <div class="linea"><span>Pagado hasta ahora</span><b style="color:var(--verde)">${money(pagado)}</b></div>
-    <div class="linea final"><span>Saldo pendiente</span><b style="color:${saldo > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(saldo)}</b></div>
-  </div>
-  ${saldo > 0 ? `
-  <div class="grid g2" style="margin-top:12px">
-    <div><button class="btn" style="width:100%" onclick="registrarAnticipo('${id}')" ${pagado >= anticipoSugerido - 0.004 ? 'disabled' : ''}>
-      💰 Registrar anticipo (50% = ${money(anticipoSugerido)})
-    </button></div>
-    <div style="display:flex;gap:8px;align-items:end">
-      <div style="flex:1"><label>Abono libre</label><input type="number" id="pp_abono" value="${saldo.toFixed(2)}" min="0.01" max="${saldo}" step="0.01"></div>
-      <button class="btn sec" onclick="guardarPagoLibre('${id}')">Registrar</button>
-    </div>
-  </div>
-  <div id="pagoError"></div>` : `<div class="nota" style="margin-top:10px">✅ Este taller ya está pagado por completo.</div>`}
-
-  <h3 style="margin:18px 0 10px">Historial de pagos</h3>
-  <div class="card" style="padding:12px 16px">
-    ${pagosDeEsta.length ? pagosDeEsta.map(p => `<div class="linea"><span>${fmtFecha(p.fecha)}${p.nota ? ' · ' + esc(p.nota) : ''}</span><b>${money(p.monto)}</b></div>`).join('') : '<p class="tiny mut">Aún no hay pagos registrados.</p>'}
-  </div>
   <div class="acciones"><button class="btn sec" onclick="cerrar('mSesion')">Cerrar</button></div>`;
   abrir('mSesion');
   actualizarTotalNuevoParticipante();
 }
 
-/** Recalcula en vivo el total del participante que se está por agregar (suma de talleres elegidos + café). */
+/** Recalcula en vivo el total del participante que se está por agregar (suma de talleres × cantidad + café). */
 function actualizarTotalNuevoParticipante() {
   const preview = document.getElementById('pp_total_preview');
   if (!preview) return;
-  const idsSeleccionados = [...document.querySelectorAll('.pp_taller_chk:checked')].map(chk => chk.value);
-  const cafe = document.getElementById('pp_cafe')?.checked || false;
-  const totalTalleres = idsSeleccionados.reduce((t, id2) => { const c = combo(id2); return t + (c ? comboPrecio(c) : 0); }, 0);
+  let totalTalleres = 0;
+  const detalle = [];
+  document.querySelectorAll('#pp_talleres_lista .filaMat').forEach(f => {
+    const comboId = f.querySelector('.ppt-combo')?.value;
+    const cant = Math.max(1, num(f.querySelector('.ppt-cant')?.value) || 1);
+    const c = comboId ? combo(comboId) : null;
+    if (c) {
+      const sub = comboPrecio(c) * cant;
+      totalTalleres += sub;
+      detalle.push(`<div class="linea"><span>${esc(c.nombre)}${cant > 1 ? ` ×${cant}` : ''}</span><b>${money(sub)}</b></div>`);
+    }
+  });
+  const cafeChk = document.getElementById('pp_cafe');
+  const cafe = cafeChk ? cafeChk.checked : false;
   const cafeMonto = cafe ? num(DB.settings.cafe_precio || CAFE_DEFAULT) : 0;
   preview.innerHTML = `
-    ${idsSeleccionados.length ? `<div class="linea"><span>${idsSeleccionados.length} taller(es) elegido(s)</span><b>${money(totalTalleres)}</b></div>` : ''}
+    ${detalle.join('')}
     ${cafe ? `<div class="linea cafe"><span>☕ Café</span><b>${money(cafeMonto)}</b></div>` : ''}
     <div class="linea final"><span>Total de este participante</span><b>${money(totalTalleres + cafeMonto)}</b></div>`;
 }
@@ -735,44 +826,59 @@ async function guardarParticipante(reservaId) {
   const r = reserva(reservaId);
   const nombre = document.getElementById('pp_nom').value.trim();
   const telefono = document.getElementById('pp_tel').value.trim();
-  const comboIds = [...document.querySelectorAll('.pp_taller_chk:checked')].map(chk => chk.value);
+  const cuentaSel = document.getElementById('pp_cuenta').value; // 'nueva' o id de cuenta existente
   const incluyeCafe = document.getElementById('pp_cafe').checked;
+  const filasTalleres = leerFilasTalleres('pp_talleres_lista');
+
   if (!nombre) return errBox.innerHTML = `<div class="error-box">Escribe el nombre del participante.</div>`;
-  if (!comboIds.length) return errBox.innerHTML = `<div class="error-box">Selecciona al menos un taller que vaya a hacer (crea uno en 🎁 Juegos/Combos si aún no tienes ninguno).</div>`;
+  if (!filasTalleres.length) return errBox.innerHTML = `<div class="error-box">Selecciona al menos un taller que vaya a hacer.</div>`;
   if (!hayCupo(r)) return errBox.innerHTML = `<div class="error-box">El cupo de este taller ya está lleno.</div>`;
 
-  const talleresElegidos = comboIds.map(cid => combo(cid)).filter(Boolean);
+  const combosElegidos = filasTalleres.map(f => ({ c: combo(f.combo_id), cantidad: f.cantidad })).filter(x => x.c);
+  if (!combosElegidos.length) return errBox.innerHTML = `<div class="error-box">Selecciona un taller válido (crea uno en 🎁 Juegos/Combos si aún no tienes ninguno).</div>`;
+
   const cafeMonto = incluyeCafe ? num(DB.settings.cafe_precio || CAFE_DEFAULT) : 0;
-  const precioTotal = talleresElegidos.reduce((t, c) => t + comboPrecio(c), 0);
-  const costoTotal = talleresElegidos.reduce((t, c) => t + comboCosto(c), 0);
+  const precioTotal = combosElegidos.reduce((t, x) => t + comboPrecio(x.c) * x.cantidad, 0);
   const montoTotal = precioTotal + cafeMonto;
 
-  // Se combinan los materiales de TODOS los talleres elegidos para verificar/descontar inventario en un solo paso.
-  const materialesCombinados = talleresElegidos.flatMap(c => c.materiales || []);
-  const consumo = expandirReceta(materialesCombinados, 1);
-  for (const [materialId, cantidadReq] of consumo) {
+  // Verificar inventario combinado de todos los talleres elegidos (ya multiplicados por su cantidad)
+  const mapasConsumo = combosElegidos.map(x => expandirReceta(x.c.materiales, x.cantidad));
+  const consumoTotal = sumarMapas(...mapasConsumo);
+  for (const [materialId, cantidadReq] of consumoTotal) {
     const m = mat(materialId);
     if (!m || num(m.existencia) < cantidadReq) return errBox.innerHTML = `<div class="error-box">Inventario insuficiente de ${m ? esc(m.nombre) : 'material'} para los talleres elegidos.</div>`;
   }
-  for (const [materialId, cantidadReq] of consumo) {
+
+  // Determinar/crear la cuenta de pago
+  let cuentaId = cuentaSel;
+  if (cuentaSel === 'nueva') {
+    const { data: nuevaCuenta, error: errCta } = await sb.from('cuentas').insert({ reserva_id: reservaId }).select().single();
+    if (errCta) return errBox.innerHTML = `<div class="error-box">${esc(errCta.message)}</div>`;
+    cuentaId = nuevaCuenta.id;
+  }
+  const esTitular = participantesDeCuenta(cuentaId).length === 0;
+
+  // Descontar inventario
+  for (const [materialId, cantidadReq] of consumoTotal) {
     const m = mat(materialId);
     const { error } = await sb.from('materials').update({ existencia: num(m.existencia) - cantidadReq }).eq('id', m.id);
     if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   }
 
-  const esTitular = participantesDe(reservaId).length === 0;
+  // Insertar participante
   const { data: nuevoParticipante, error } = await sb.from('reserva_participantes').insert({
-    reserva_id: reservaId, nombre, telefono, es_titular: esTitular,
+    reserva_id: reservaId, cuenta_id: cuentaId, nombre, telefono, es_titular: esTitular,
     incluye_cafe: incluyeCafe, cafe_monto: cafeMonto, monto_total: montoTotal
   }).select().single();
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
 
-  // Un renglón en participante_talleres por cada taller que eligió esta persona.
-  const filasTalleres = talleresElegidos.map(c => ({
-    participante_id: nuevoParticipante.id, combo_id: c.id, combo_nombre: c.nombre,
-    precio_taller: comboPrecio(c), costo_taller: comboCosto(c), materiales_snapshot: c.materiales
+  // Un renglón por cada taller (y cantidad) que eligió esta persona
+  const filasInsert = combosElegidos.map(x => ({
+    participante_id: nuevoParticipante.id, combo_id: x.c.id, combo_nombre: x.c.nombre,
+    cantidad: x.cantidad, precio_taller: comboPrecio(x.c), costo_taller: comboCosto(x.c),
+    materiales_snapshot: x.c.materiales
   }));
-  const { error: errorTalleres } = await sb.from('participante_talleres').insert(filasTalleres);
+  const { error: errorTalleres } = await sb.from('participante_talleres').insert(filasInsert);
   if (errorTalleres) return errBox.innerHTML = `<div class="error-box">El participante se guardó, pero hubo un problema al registrar sus talleres: ${esc(errorTalleres.message)}</div>`;
 
   await cargarTodo();
@@ -783,41 +889,50 @@ async function quitarParticipante(participanteId, reservaId) {
   if (!confirm('¿Quitar a este participante? Se restaurará el material de TODOS los talleres que tenía elegidos.')) return;
   const p = DB.participantes.find(x => x.id === participanteId);
   if (!p) return;
-  const consumo = expandirReceta(materialesCombinadosParticipante(participanteId), 1);
+  const consumo = consumoDeParticipante(participanteId);
   for (const [materialId, cantidad] of consumo) {
     const m = mat(materialId);
     if (m) await sb.from('materials').update({ existencia: num(m.existencia) + cantidad }).eq('id', m.id);
   }
+  const cuentaId = p.cuenta_id;
   const { error } = await sb.from('reserva_participantes').delete().eq('id', participanteId);
   if (error) return alert(error.message);
+
+  // Si la cuenta se quedó sin nadie y sin pagos registrados, se elimina para no dejar basura.
+  const quedan = DB.participantes.filter(x => x.cuenta_id === cuentaId && x.id !== participanteId);
+  const pagosDeCuenta = DB.pagos.filter(pg => pg.cuenta_id === cuentaId);
+  if (!quedan.length && !pagosDeCuenta.length) {
+    await sb.from('cuentas').delete().eq('id', cuentaId);
+  }
+
   await cargarTodo();
   gestionarInscripcion(reservaId);
 }
 
-async function registrarAnticipo(reservaId) {
-  const total = totalReserva(reservaId), pagado = pagadoReserva(reservaId);
+async function registrarAnticipoCuenta(cuentaId, reservaId) {
+  const total = totalCuenta(cuentaId), pagado = pagadoCuenta(cuentaId);
   const anticipo = total / 2;
   const falta = anticipo - pagado;
   if (falta <= 0.004) return;
-  const { error } = await sb.from('pagos').insert({ reserva_id: reservaId, fecha: hoy(), monto: falta, nota: 'Anticipo (50%)' });
+  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, fecha: hoy(), monto: falta, nota: 'Anticipo (50%)' });
   if (error) return alert(error.message);
   await cargarTodo();
   gestionarInscripcion(reservaId);
 }
-async function guardarPagoLibre(reservaId) {
-  const errBox = document.getElementById('pagoError'); if (errBox) errBox.innerHTML = '';
-  const saldo = saldoReserva(reservaId);
-  const monto = num(document.getElementById('pp_abono').value);
+async function guardarPagoLibreCuenta(cuentaId, reservaId) {
+  const errBox = document.getElementById('pagoError_' + cuentaId);
+  const saldo = saldoCuenta(cuentaId);
+  const monto = num(document.getElementById('abono_' + cuentaId).value);
   if (monto <= 0) return errBox.innerHTML = `<div class="error-box">Captura un monto válido.</div>`;
   if (monto > saldo + 0.01) return errBox.innerHTML = `<div class="error-box">Ese monto es mayor al saldo pendiente (${money(saldo)}).</div>`;
-  const { error } = await sb.from('pagos').insert({ reserva_id: reservaId, fecha: hoy(), monto, nota: 'Abono' });
+  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, fecha: hoy(), monto, nota: 'Abono' });
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   await cargarTodo();
   gestionarInscripcion(reservaId);
 }
 
 /* =====================================================================
-   VENTAS (materiales o juegos vendidos fuera de una inscripción)
+   VENTAS (materiales o juegos vendidos fuera de un taller)
    ===================================================================== */
 V.ventas = () => {
   const filas = DB.ventas.map(v => `<tr>
@@ -826,7 +941,7 @@ V.ventas = () => {
       <td>${money(v.costo)}</td><td style="color:var(--verde);font-weight:700">${money(v.total - v.costo)}</td></tr>`).join('');
   return `
   <h2 class="titulo">🛍️ Ventas</h2>
-  <p class="sub">Para productos y juegos vendidos fuera de una inscripción. El precio se propone solo, ya con su margen.</p>
+  <p class="sub">Para productos y juegos vendidos fuera de un taller. El precio se propone solo, ya con su margen.</p>
   <div style="margin-bottom:16px"><button class="btn" onclick="nuevaVenta()">＋ Nueva venta</button></div>
   <div class="tabla-wrap"><table>
     <thead><tr><th>Fecha</th><th>Producto</th><th>Cantidad</th><th>Precio unitario</th><th>Total</th><th>Costo</th><th>Ganancia</th></tr></thead>
@@ -902,23 +1017,25 @@ V.resultados = () => {
   const cV = DB.ventas.reduce((t, v) => t + num(v.costo), 0);
   const vendido = vT + vV, costo = cT + cV, util = vendido - costo;
 
-  const pendientes = DB.reservas
-    .map(r => ({ r, saldo: saldoReserva(r.id) }))
-    .filter(x => x.saldo > 0)
+  const pendientes = DB.cuentas
+    .map(c => ({ c, saldo: saldoCuenta(c.id) }))
+    .filter(x => x.saldo > 0 && participantesDeCuenta(x.c.id).length)
     .sort((a, b) => b.saldo - a.saldo);
   const totalPorCobrar = pendientes.reduce((t, x) => t + x.saldo, 0);
 
-  const filasPendientes = pendientes.map(({ r, saldo }) => {
-    const titular = titularDe(r.id);
-    const est = estadoPagoReserva(r.id);
+  const filasPendientes = pendientes.map(({ c, saldo }) => {
+    const ps = participantesDeCuenta(c.id);
+    const r = reserva(c.reserva_id);
+    const est = estadoPagoCuenta(c.id);
     return `<tr>
-      <td>${fmtFecha(r.fecha)}</td>
-      <td><b>${titular ? esc(titular.nombre) : '—'}</b>${titular && titular.telefono ? `<span class="mut">${esc(titular.telefono)}</span>` : ''}</td>
-      <td>${money(totalReserva(r.id))}</td>
-      <td>${money(pagadoReserva(r.id))}</td>
+      <td>${r ? fmtFecha(r.fecha) : '—'}</td>
+      <td><b>${esc(ps[0].nombre)}</b>${ps.length > 1 ? `<span class="mut">+${ps.length - 1} más</span>` : ''}${ps[0].telefono ? `<span class="mut">${esc(ps[0].telefono)}</span>` : ''}</td>
+      <td>${r && r.nombre ? esc(r.nombre) : '—'}</td>
+      <td>${money(totalCuenta(c.id))}</td>
+      <td>${money(pagadoCuenta(c.id))}</td>
       <td><b style="color:var(--rojo)">${money(saldo)}</b></td>
       <td><span class="chip ${est.clase}">${est.label}</span></td>
-      <td><button class="btn sec mini" onclick="gestionarInscripcion('${r.id}')">💳 Ver / Pago</button></td>
+      <td><button class="btn sec mini" onclick="gestionarInscripcion('${c.reserva_id}')">💳 Ver / Pago</button></td>
     </tr>`;
   }).join('');
 
@@ -931,19 +1048,20 @@ V.resultados = () => {
     <div class="kpi"><small>MARGEN</small><b>${vendido > 0 ? (util / vendido * 100).toFixed(1) : 0}%</b></div>
   </div>
   <div class="card" style="margin-top:18px"><h3>Desglose</h3>
-    <div class="linea"><span>Talleres (inscripciones)</span><b>${money(vT)}</b></div>
+    <div class="linea"><span>Talleres</span><b>${money(vT)}</b></div>
     <div class="linea"><span>Ventas de productos y juegos</span><b>${money(vV)}</b></div>
     <div class="linea cafe"><span>☕ Café para el negocio</span><b>${money(cafeTotal)}</b></div>
     <div class="linea final"><span>Total ingresado</span><b>${money(vendido)}</b></div>
   </div>
   <div class="card" style="margin-top:18px">
     <h3>💰 Cuentas por cobrar</h3>
+    <p class="tiny mut" style="margin-bottom:10px">Cada cuenta es un grupo de pago independiente (una persona sola, o varias que vinieron juntas y decidieron compartir cuenta).</p>
     <div class="totales" style="margin-bottom:14px">
       <div class="linea final"><span>Total que te deben</span><b style="color:${totalPorCobrar > 0 ? 'var(--rojo)' : 'var(--verde)'}">${money(totalPorCobrar)}</b></div>
     </div>
     <div class="tabla-wrap"><table>
-      <thead><tr><th>Fecha</th><th>Titular</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
-      <tbody>${filasPendientes || `<tr><td colspan="7" style="text-align:center;color:var(--gris);padding:22px">🎉 No debe nadie, todo está pagado.</td></tr>`}</tbody>
+      <thead><tr><th>Fecha</th><th>Cuenta (titular)</th><th>Taller</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead>
+      <tbody>${filasPendientes || `<tr><td colspan="8" style="text-align:center;color:var(--gris);padding:22px">🎉 No debe nadie, todo está pagado.</td></tr>`}</tbody>
     </table></div>
   </div>`;
 };
@@ -976,7 +1094,8 @@ async function respaldar() {
   const data = {
     exportado_en: new Date().toISOString(),
     materiales: DB.materiales, combos: DB.combos,
-    reservas: DB.reservas, participantes: DB.participantes, participanteTalleres: DB.participanteTalleres, pagos: DB.pagos,
+    reservas: DB.reservas, cuentas: DB.cuentas, participantes: DB.participantes,
+    participanteTalleres: DB.participanteTalleres, pagos: DB.pagos,
     ventas: DB.ventas, sesionesAntiguas: DB.sesionesAntiguas, settings: DB.settings
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
