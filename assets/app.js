@@ -1,24 +1,25 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v2.3.0
+   TALLERES CREATIVOS · v2.3.1
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
-   NOVEDAD v2.3.0 — SEPARACIÓN CLARA DE "TU DINERO" VS "CAFÉ":
-   Antes, el monto total de cada participante mezclaba en un solo
-   número el precio del taller (tu ingreso) y el café (dinero que es
-   para la cafetería, no para ti). Esto hacía confuso saber cuánto te
-   corresponde a ti y cuánto a la cafetería, tanto al inscribir a
-   alguien, como en la cuenta de pago, como en Resultados.
+   NOVEDAD v2.3.1 — CORRECCIÓN: el "scroll" del mouse ya no cambia los
+   números por accidente.
+   Los campos de tipo número (<input type="number">) tienen un
+   comportamiento del NAVEGADOR (no de esta app) donde, si el campo
+   tiene el foco (el cursor parpadeando ahí) y giras la rueda del mouse
+   -aunque sea para bajar la pantalla-, el navegador le suma o resta al
+   valor silenciosamente. Por eso a veces escribías "55" y al guardar
+   aparecía "50": el scroll le restó 5 sin que se notara.
+   Ahora, en TODA la aplicación, cualquier campo numérico se "desenfoca"
+   automáticamente en cuanto detecta scroll, así el mouse nunca vuelve
+   a alterar un valor que ya escribiste.
 
-   Ahora, en TODOS lados donde aparece dinero, se desglosa siempre:
-     🎨 Talleres (tuyo)  +  ☕ Café (para la cafetería)  =  Total a cobrar
-   - "VENDIDO" / utilidad / margen se calculan SOLO con lo tuyo
-     (talleres + ventas sueltas), sin mezclar el café.
-   - El café se muestra siempre aparte, claramente etiquetado.
-   - El "Total a cobrar" (lo que el cliente paga en efectivo) sigue
-     siendo la suma de ambos, porque es el dinero real que se cobra,
-     aunque una parte no se quede contigo.
+   NOVEDAD v2.3.0 — SEPARACIÓN CLARA DE "TU DINERO" VS "CAFÉ":
+   En cuentas de pago, al inscribir participantes y en Resultados,
+   ahora siempre se desglosa: 🎨 Talleres (tuyo) + ☕ Café (cafetería)
+   = Total a cobrar. "VENDIDO"/utilidad/margen solo usan lo tuyo.
 
    "Talleres" funciona en 3 niveles:
    1) 🎁 Juegos/Combos = catálogo de "qué taller se puede hacer"
@@ -42,6 +43,21 @@ const hoy = () => new Date().toISOString().slice(0, 10);
 const fmtFecha = f => f ? new Date(f).toLocaleDateString('es-MX') : '';
 
 const CAFE_DEFAULT = 59;
+
+/* ---------------------------------------------------------------------
+   CORRECCIÓN: evita que la rueda del mouse cambie el valor de los
+   campos numéricos por accidente. En cuanto se detecta un "scroll" en
+   cualquier parte de la pantalla, si hay un <input type="number">
+   enfocado, se le quita el foco (se "desenfoca") ANTES de que el
+   navegador alcance a modificar su valor. El scroll de la página sigue
+   funcionando normal; solo se evita que además cambie el número.
+   --------------------------------------------------------------------- */
+document.addEventListener('wheel', () => {
+  const el = document.activeElement;
+  if (el && el.tagName === 'INPUT' && el.type === 'number') {
+    el.blur();
+  }
+}, { passive: true });
 
 /* Caché de datos en memoria, se recarga después de cada guardado */
 let DB = {
@@ -116,13 +132,11 @@ function sumarMapas(...mapas) {
    PARTICIPANTES: cada quien puede elegir varios talleres, cada uno con
    su propia cantidad (ej. 2 juegos de "Taller Tazas").
 
-   IMPORTANTE (v2.3.0): el dinero de un participante siempre se separa
-   en dos partes bien distintas:
-     - "talleres" (precioTotalTalleresParticipante) = lo que es TUYO,
-       el ingreso real del negocio por los talleres que hizo.
-     - "cafe_monto" = dinero que se cobra pero es PARA LA CAFETERÍA,
-       no es ingreso del negocio de talleres.
-   monto_total = talleres + café (es el total que el cliente paga).
+   IMPORTANTE: el dinero de un participante siempre se separa en dos:
+     - "talleres" (precioTotalTalleresParticipante) = lo que es TUYO.
+     - "cafe_monto" = dinero PARA LA CAFETERÍA, no es ingreso del
+       negocio de talleres.
+   monto_total = talleres + café (total que el cliente paga).
    --------------------------------------------------------------------- */
 function talleresDeParticipante(participanteId) {
   return DB.participanteTalleres.filter(t => t.participante_id === participanteId);
@@ -385,7 +399,7 @@ function editarMat(id) {
     <div><label>Margen de ganancia (%)</label><input type="number" id="f_mar" value="${num(m.margen)}" oninput="prevMat()"></div>
   </div>
   <div class="totales" id="prevMat"></div>
-  <div class="nota">💡 El costo unitario sale de dividir el costo total entre la cantidad adquirida.</div>
+  <div class="nota">💡 El costo unitario sale de dividir el costo total entre la cantidad adquirida. Tip: si necesitas bajar en la pantalla mientras editas, primero da clic fuera de los campos numéricos para no alterarlos sin querer con la rueda del mouse.</div>
   <div id="matError"></div>
   <div class="acciones">
     ${id ? `<button class="btn rojo" onclick="borrarMat('${id}')">Eliminar</button>` : ''}
