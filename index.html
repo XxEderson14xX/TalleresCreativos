@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Talleres Creativos</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<!-- ============== PANTALLA DE LOGIN ============== -->
+<section id="loginScreen" class="login-screen">
+  <form id="loginForm" class="login-card">
+    <h1>🎨 Talleres Creativos</h1>
+    <p class="login-sub">Inicia sesión para continuar.</p>
+    <label>Correo</label>
+    <input id="loginEmail" type="email" required placeholder="tucorreo@ejemplo.com">
+    <label>Contraseña</label>
+    <input id="loginPassword" type="password" required placeholder="••••••••">
+    <p id="loginError" class="login-error"></p>
+    <button type="submit" class="btn" id="loginSubmit">Iniciar sesión</button>
+  </form>
+</section>
+
+<!-- ============== APP PRINCIPAL ============== -->
+<div id="appRoot" class="app-root" style="display:none">
+  <nav id="menu">
+    <h1>🎨 TALLERES<br>CREATIVOS</h1>
+    <button data-v="inicio" class="on">🏠 Inicio</button>
+    <button data-v="talleres">🎨 Talleres</button>
+    <button data-v="inventario">📦 Inventario</button>
+    <button data-v="combos">🎁 Juegos / Combos</button>
+    <button data-v="ventas">🛍️ Ventas</button>
+    <button data-v="resultados">📊 Resultados</button>
+    <button data-v="admin">⚙️ Administración</button>
+    <div class="user-box">
+      <span id="userEmailLabel"></span>
+      <button id="btnLogout" class="btn sec mini" type="button">Cerrar sesión</button>
+    </div>
+  </nav>
+  <main id="app"><p>Cargando…</p></main>
+</div>
+
+<!-- Modales (uno por tipo de formulario) -->
+<div class="modal" id="mMat"><div class="modal-box" id="boxMat"></div></div>
+<div class="modal" id="mTipo"><div class="modal-box" id="boxTipo"></div></div>
+<div class="modal" id="mCombo"><div class="modal-box" id="boxCombo"></div></div>
+<div class="modal" id="mVenta"><div class="modal-box" id="boxVenta"></div></div>
+<div class="modal" id="mSesion"><div class="modal-box" id="boxSesion"></div></div>
+
+<!-- Cliente de Supabase (CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<!-- Configuración: tus llaves de Supabase -->
+<script src="assets/config.js"></script>
+<!-- Lógica de la aplicación -->
+<script src="assets/app.js"></script>
+</body>
+</html>
