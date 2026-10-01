@@ -1,9 +1,12 @@
 /* =====================================================================
-   TALLERES CREATIVOS · v2.3.1
+   TALLERES CREATIVOS · v2.3.2
    Un solo archivo de lógica, sin frameworks ni módulos raros.
    Los datos viven en Supabase (Postgres + Auth). Todo lo demás
    (cálculos, pantallas, modales) es JavaScript plano.
 
+   NOVEDAD v2.3.2 — CORRECCIÓN DE PAGOS: cada pago registrado desde una cuenta
+   de reserva envía cuenta_id + reserva_id, cumpliendo la restricción
+   pagos_referencia_valida.
    NOVEDAD v2.3.1 — CORRECCIÓN: el "scroll" del mouse ya no cambia los
    números por accidente.
    Los campos de tipo número (<input type="number">) tienen un
@@ -951,7 +954,10 @@ async function registrarAnticipoCuenta(cuentaId, reservaId) {
   const anticipo = total / 2;
   const falta = anticipo - pagado;
   if (falta <= 0.004) return;
-  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, fecha: hoy(), monto: falta, nota: 'Anticipo (50%)' });
+  const cta = cuenta(cuentaId);
+  if (!cta || !cta.reserva_id) return alert('La cuenta no tiene una reserva asociada. Recarga la página e inténtalo nuevamente.');
+  const referenciaReserva = cta.reserva_id || reservaId;
+  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, reserva_id: referenciaReserva, sesion_id: null, fecha: hoy(), monto: falta, nota: 'Anticipo (50%)' });
   if (error) return alert(error.message);
   await cargarTodo();
   gestionarInscripcion(reservaId);
@@ -962,7 +968,10 @@ async function guardarPagoLibreCuenta(cuentaId, reservaId) {
   const monto = num(document.getElementById('abono_' + cuentaId).value);
   if (monto <= 0) return errBox.innerHTML = `<div class="error-box">Captura un monto válido.</div>`;
   if (monto > saldo + 0.01) return errBox.innerHTML = `<div class="error-box">Ese monto es mayor al saldo pendiente (${money(saldo)}).</div>`;
-  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, fecha: hoy(), monto, nota: 'Abono' });
+  const cta = cuenta(cuentaId);
+  if (!cta || !cta.reserva_id) return errBox.innerHTML = `<div class="error-box">La cuenta no tiene una reserva asociada. Recarga la página e inténtalo nuevamente.</div>`;
+  const referenciaReserva = cta.reserva_id || reservaId;
+  const { error } = await sb.from('pagos').insert({ cuenta_id: cuentaId, reserva_id: referenciaReserva, sesion_id: null, fecha: hoy(), monto, nota: 'Abono' });
   if (error) return errBox.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
   await cargarTodo();
   gestionarInscripcion(reservaId);
