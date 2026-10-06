@@ -314,8 +314,32 @@ function go(v) {
   document.getElementById('app').innerHTML = V[v]();
 }
 
-const abrir = id => document.getElementById(id).classList.add('on');
-const cerrar = id => document.getElementById(id).classList.remove('on');
+const abrir = id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.add('on');
+  // Accessibility: focus the first focusable input or element inside the modal
+  setTimeout(() => {
+    const focusable = el.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])');
+    if (focusable) focusable.focus();
+  }, 50);
+};
+const cerrar = id => {
+  const el = document.getElementById(id);
+  if (el) el.classList.remove('on');
+};
+
+/* Micro-UX & Accessibility: Close modals with Escape key or clicking backdrop */
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal.on').forEach(m => m.classList.remove('on'));
+  }
+});
+document.addEventListener('click', (e) => {
+  if (e.target && e.target.classList && e.target.classList.contains('modal') && e.target.classList.contains('on')) {
+    e.target.classList.remove('on');
+  }
+});
 
 const V = {};
 
@@ -392,7 +416,7 @@ function editarMat(id) {
   const m = id ? mat(id) : { nombre: '', categoria: 'Otros', unidad: 'pieza', cant_adq: 1, costo_adq: 0, existencia: 0, minimo: 0, margen: 100 };
   document.getElementById('boxMat').innerHTML = `
   <div class="modal-head"><h3>📦 ${id ? 'Editar material' : 'Nuevo material'}</h3>
-    <button class="cerrar" onclick="cerrar('mMat')">✕</button></div>
+    <button class="cerrar" aria-label="Cerrar modal" onclick="cerrar('mMat')">✕</button></div>
   <div class="grid g2">
     <div><label>Nombre</label><input id="f_nom" value="${esc(m.nombre)}"></div>
     <div><label>Categoría</label><select id="f_cat">
@@ -527,7 +551,7 @@ function editarCombo(id) {
   const autoInicial = !(num(c.precio_final) > 0);
   document.getElementById('boxCombo').innerHTML = `
   <div class="modal-head"><h3>🎁 ${id ? 'Editar juego' : 'Nuevo juego / combo'}</h3>
-    <button class="cerrar" onclick="cerrar('mCombo')">✕</button></div>
+    <button class="cerrar" aria-label="Cerrar modal" onclick="cerrar('mCombo')">✕</button></div>
   <div class="grid g2">
     <div><label>Nombre del juego (así lo verán al elegir su taller)</label><input id="c_nom" value="${esc(c.nombre)}" placeholder="Ej. Taller Cerámica"></div>
     <div><label>Margen deseado (%)</label><input type="number" id="c_mar" value="${num(c.margen)}" oninput="prevCombo()"></div>
@@ -667,7 +691,7 @@ function nuevaInscripcion(id) {
   const r = id ? reserva(id) : { nombre: '', fecha: hoy(), horario: '', cupo: 4, duracion: 2 };
   document.getElementById('boxTipo').innerHTML = `
   <div class="modal-head"><h3>🎨 ${id ? 'Editar taller' : 'Nuevo taller'}</h3>
-    <button class="cerrar" onclick="cerrar('mTipo')">✕</button></div>
+    <button class="cerrar" aria-label="Cerrar modal" onclick="cerrar('mTipo')">✕</button></div>
   <div class="grid g2">
     <div style="grid-column:1 / -1"><label>Nombre del taller</label><input id="i_nom" value="${esc(r.nombre || '')}" placeholder="Ej. Taller sabatino, Cumpleaños de Ana"></div>
     <div><label>Fecha</label><input type="date" id="i_fec" value="${r.fecha}"></div>
@@ -804,7 +828,7 @@ function gestionarInscripcion(id) {
 
   document.getElementById('boxSesion').innerHTML = `
   <div class="modal-head"><h3>🎨 ${r.nombre ? esc(r.nombre) : 'Taller'} — ${fmtFecha(r.fecha)}${r.horario ? ' · ' + esc(r.horario) : ''}</h3>
-    <button class="cerrar" onclick="cerrar('mSesion')">✕</button></div>
+    <button class="cerrar" aria-label="Cerrar modal" onclick="cerrar('mSesion')">✕</button></div>
   <p class="tiny mut">Cupo: ${participantesDe(id).length}/${num(r.cupo)} · Duración estimada: ${num(r.duracion)} h
     <button class="btn sec mini" style="margin-left:8px" onclick="cerrar('mSesion');nuevaInscripcion('${id}')">✏️ Editar datos</button></p>
 
@@ -1011,7 +1035,7 @@ function nuevaVenta() {
   const opts = DB.combos.map(c => `<option value="combo:${c.id}">🎁 ${esc(c.nombre)}</option>`).join('')
              + DB.materiales.map(m => `<option value="${refMat(m.id)}">${esc(m.nombre)}</option>`).join('');
   document.getElementById('boxVenta').innerHTML = `
-  <div class="modal-head"><h3>🛍️ Nueva venta</h3><button class="cerrar" onclick="cerrar('mVenta')">✕</button></div>
+  <div class="modal-head"><h3>🛍️ Nueva venta</h3><button class="cerrar" aria-label="Cerrar modal" onclick="cerrar('mVenta')">✕</button></div>
   <div class="grid g2">
     <div><label>Producto o juego</label><select id="v_prod" onchange="autoPrecio()">${opts}</select></div>
     <div><label>Cantidad</label><input type="number" id="v_cant" value="1" min="1" oninput="prevVenta()"></div>
