@@ -1,0 +1,3 @@
+## 2026-10-06 - Map Indexing for Frequently Looked-Up Entities
+**Learning:** In client-side JS apps with frequent calculations (like recipe expansion and participant inventory consumption across loops), repeated `Array.prototype.find()` calls cause O(N*M) performance bottlenecks. Populating `Map` instances during data load (`cargarTodo()`) turns lookup functions like `mat(id)` and `combo(id)` into O(1) operations without altering data structures or breaking component rendering logic.
+**Action:** Always maintain Map indexes alongside entity arrays when entities are referenced repeatedly by foreign keys in client-side calculations.

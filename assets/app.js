@@ -65,6 +65,7 @@ document.addEventListener('wheel', () => {
 /* Caché de datos en memoria, se recarga después de cada guardado */
 let DB = {
   materiales: [], combos: [],
+  materialesMap: new Map(), combosMap: new Map(),
   reservas: [], cuentas: [], participantes: [], participanteTalleres: [], pagos: [],
   ventas: [], sesionesAntiguas: [],
   settings: { cafe_precio: CAFE_DEFAULT }
@@ -73,8 +74,10 @@ let DB = {
 /* Filtro de fechas para la lista de talleres */
 let filtroInscripciones = { desde: '', hasta: '' };
 
-const mat = id => DB.materiales.find(m => m.id === id);
-const combo = id => DB.combos.find(c => c.id === id);
+// ⚡ Bolt Optimization: O(1) Map lookup replacing O(N) Array.prototype.find
+// Eliminates repetitive O(N*M) linear scans during recipe calculations and list renders.
+const mat = id => DB.materialesMap.get(id);
+const combo = id => DB.combosMap.get(id);
 const reserva = id => DB.reservas.find(r => r.id === id);
 const cuenta = id => DB.cuentas.find(c => c.id === id);
 
@@ -286,6 +289,9 @@ async function cargarTodo() {
   ]);
   DB.materiales = materiales.data || [];
   DB.combos = combos.data || [];
+  // ⚡ Bolt Optimization: Build O(1) Map indexes for fast material & combo lookup
+  DB.materialesMap = new Map(DB.materiales.map(m => [m.id, m]));
+  DB.combosMap = new Map(DB.combos.map(c => [c.id, c]));
   DB.reservas = reservas.data || [];
   DB.cuentas = cuentas.data || [];
   DB.participantes = participantes.data || [];
